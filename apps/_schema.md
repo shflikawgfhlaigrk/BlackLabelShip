@@ -12,13 +12,13 @@ Loader tries stdlib `tomllib` (py3.11+), falls back to the built-in mini-parser 
 | `bundle_id` | string | CFBundleIdentifier, e.g. `com.blacklabel.sovereign` |
 | `app_name` | string | built .app name, e.g. `Black Label Sovereign.app` |
 | `build_cmd` | string | command run inside `repo` that produces the .app (repo's own script) |
-| `built_app_path` | string | where `build_cmd` leaves the .app, relative to `repo` (e.g. `dist/Black Label Sovereign.app`) |
+| `built_app_path` | string | where `build_cmd` leaves the .app — relative to `repo` OR absolute/~ (e.g. `/tmp/bls-devid/Black Label Sovereign.app`) |
 | `arch` | string | `universal2` or `arm64` (universal2 required for TRD/RE/ACA lanes) |
 | `required_entitlements` | array | every entitlement that MUST be present post-sign (positive gate) |
 | `forbidden_entitlements` | array | entitlements that must NOT appear (may be empty `[]`) |
 | `ships_no_data_globs` | array | glob patterns that must match NOTHING inside the bundle (db/csv/tokens/pem/PII) |
 | `r2_dl_key` | string | R2 object key for the storefront download, e.g. `sovereign.zip` (bucket `sovereign-files`) |
-| `r2_updates_key` | string | R2 object key for the updater channel, e.g. `updates/Black-Label-Sovereign.zip` |
+| `r2_updates_key` | string | R2 object key template for the updater channel, `{build}` substituted at ship time, e.g. `updates/sovereign/{build}.zip` (matches live realestate manifest convention) |
 | `manifest_endpoint` | string | live manifest URL path, e.g. `/api/version/sovereign` |
 | `dl_url` | string | full public download URL used by the live gate (with comp key `?k=…` if gated) |
 
