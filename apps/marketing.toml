@@ -1,0 +1,19 @@
+# Black Label Marketing — Developer-ID lane (values verified against repo 2026-07-01)
+# Pure-Swift (no bundled runtime). Non-sandboxed + Hardened Runtime; devid entitlements are empty on
+# purpose (network.client / files.user-selected are SANDBOX ents — vestigial on a non-sandboxed app).
+repo = "~/BlackLabelMarketing"
+bundle_id = "com.blacklabel.marketing"
+app_name = "Black Label Marketing.app"
+build_cmd = "./build.command --devid --no-open"
+built_app_path = "build/release-provenance/Release/Black Label Marketing.app"
+arch = "universal2"
+required_entitlements = []
+forbidden_entitlements = ["com.apple.security.app-sandbox"]
+ships_no_data_globs = ["*.sqlite", "*.sqlite3", "*.db", "*.csv", "*.pem", "*.key", "*.tokens", "*secrets*", "leads*", "*.env"]
+r2_dl_key = "marketing.zip"
+r2_updates_key = "updates/marketing/{build}.zip"
+manifest_endpoint = "/api/version/marketing"
+dl_url = "https://blacklabelbots.com/dl/marketing.zip?k=c76acb879e8fe0d8d69a9b081e01758d"
+ports = []
+test_cmd = "bash Tests/run.sh"
+entitlements_file = "Sources/app-devid.entitlements"
