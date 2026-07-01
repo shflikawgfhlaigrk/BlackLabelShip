@@ -1,0 +1,20 @@
+# Black Label Real Estate — Developer-ID lane (values verified against repo 2026-07-01)
+# Native Swift, no bundled runtime. --devid = non-sandbox + hardened runtime (the ONLY build the
+# in-app updater can self-replace; sandbox forbids self-replace). devid entitlements are empty on
+# purpose (sandbox/file ents are vestigial on a non-sandboxed app). Universal2 (arm64 + x86_64).
+repo = "~/BlackLabelRealEstate"
+bundle_id = "com.blacklabel.realestate"
+app_name = "Black Label Real Estate.app"
+build_cmd = "./build.command --devid"
+built_app_path = "build/Black Label Real Estate.app"
+arch = "universal2"
+required_entitlements = []
+forbidden_entitlements = ["com.apple.security.app-sandbox"]
+ships_no_data_globs = ["*.sqlite", "*.sqlite3", "*.db", "*.csv", "*.pem", "*.key", "*.tokens", "*secrets*", "parcels*", "owners*", "*.env"]
+r2_dl_key = "realestate.zip"
+r2_updates_key = "updates/realestate/{build}.zip"
+manifest_endpoint = "/api/version/realestate"
+dl_url = "https://blacklabelbots.com/dl/realestate.zip?k=c76acb879e8fe0d8d69a9b081e01758d"
+ports = []
+test_cmd = "./run_tests.command"
+entitlements_file = "Sources/app-devid.entitlements"
