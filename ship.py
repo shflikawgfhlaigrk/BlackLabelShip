@@ -193,13 +193,22 @@ def gate_entitlements(app_path, cfg):
 
 
 def gate_ships_no_data(app_path, cfg):
+    """Flag buyer DATA/secrets in the bundle. Buyer data is never Python/interpreter SOURCE, so
+    skip .py/.pyc/__pycache__ — otherwise a bundled interpreter's own stdlib (e.g. secrets.py,
+    this_module.py) false-trips the `*secrets*`-style name globs. Real leaks are data files:
+    .sqlite/.db/.csv/.pem/.key/.env/tokens/named dumps."""
+    import fnmatch
     hits = []
     pats = [p.lower() for p in cfg["ships_no_data_globs"]]
-    for root, _dirs, files in os.walk(app_path):
+    SOURCE_EXT = (".py", ".pyc", ".pyi", ".pyo")
+    for root, dirs, files in os.walk(app_path):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
         for fn in files:
+            if fn.endswith(SOURCE_EXT):
+                continue
             low = fn.lower()
             for pat in pats:
-                if __import__("fnmatch").fnmatch(low, pat):
+                if fnmatch.fnmatch(low, pat):
                     hits.append(os.path.relpath(os.path.join(root, fn), app_path))
                     break
     return None if not hits else f"ships-no-data: bundle contains {hits[:10]}"
@@ -352,11 +361,21 @@ def stage_notarize(app_path, cfg, name):
     r = _run(["ditto", "-c", "-k", "--keepParent", "--noextattr", app_path, sub])
     if r.returncode != 0:
         fail(f"notarize: zip failed: {r.stderr.strip()[:200]}")
-    r = _run(["xcrun", "notarytool", "submit", sub, "--keychain-profile", NOTARY_PROFILE,
-              "--no-wait", "--output-format", "json"])
-    if r.returncode != 0:
-        fail(f"notarize: submit failed: {(r.stderr or r.stdout).strip()[:300]}")
-    sid = json.loads(r.stdout)["id"]
+    sid = None
+    for attempt in range(1, 4):
+        r = _run(["xcrun", "notarytool", "submit", sub, "--keychain-profile", NOTARY_PROFILE,
+                  "--no-wait", "--output-format", "json"])
+        if r.returncode == 0 and r.stdout.strip():
+            try:
+                sid = json.loads(r.stdout)["id"]
+                break
+            except (ValueError, KeyError):
+                pass
+        detail = (r.stderr or r.stdout).strip()[:200]
+        print(f"  notarize: submit attempt {attempt} failed ({detail or 'empty output'}); retrying…")
+        _t.sleep(15)
+    if not sid:
+        fail("notarize: submit failed after 3 attempts")
     print(f"  notarize: submitted id={sid}; polling…")
     deadline = _t.time() + 45 * 60
     status = "In Progress"
