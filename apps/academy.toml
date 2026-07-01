@@ -6,7 +6,7 @@
 repo = "~/BlackLabelAcademy"
 bundle_id = "com.blacklabel.academy"
 app_name = "Black Label Academy.app"
-build_cmd = "SIGN_ID=05494FC15FB97F422400BC32DF6D67FC2D28855B ./build.sh"
+build_cmd = "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer SIGN_ID=05494FC15FB97F422400BC32DF6D67FC2D28855B ./build.sh"
 built_app_path = ".build-stage/Black Label Academy.app"
 arch = "universal2"
 required_entitlements = []
