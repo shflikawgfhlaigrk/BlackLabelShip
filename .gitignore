@@ -3,3 +3,5 @@ __pycache__/
 work/
 *.zip
 secrets/
+.wrangler/
+work/
