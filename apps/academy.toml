@@ -1,0 +1,21 @@
+# Black Label Academy — Developer-ID lane (values verified against repo 2026-07-01)
+# Native Swift, universal2 (lipo arm64+x86_64), hardened runtime, non-sandbox. NO bundled runtime.
+# NOTE: the app bundles Contents/Resources/BlackLabelAcademy.sqlite = the CURRICULUM (the product
+# itself, authored read-only content — 234 entries). That is the deliverable, not user/customer
+# data, so *.sqlite is intentionally NOT in ships_no_data_globs; secrets + real data still blocked.
+repo = "~/BlackLabelAcademy"
+bundle_id = "com.blacklabel.academy"
+app_name = "Black Label Academy.app"
+build_cmd = "SIGN_ID=05494FC15FB97F422400BC32DF6D67FC2D28855B ./build.sh"
+built_app_path = ".build-stage/Black Label Academy.app"
+arch = "universal2"
+required_entitlements = []
+forbidden_entitlements = ["com.apple.security.app-sandbox"]
+ships_no_data_globs = ["*.pem", "*.key", "*.tokens", "*secrets*", "*.env", "leads*", "users*", "*.csv"]
+r2_dl_key = "academy.zip"
+r2_updates_key = "updates/academy/{build}.zip"
+manifest_endpoint = "/api/version/academy"
+dl_url = "https://blacklabelbots.com/dl/academy.zip?k=c76acb879e8fe0d8d69a9b081e01758d"
+ports = []
+test_cmd = "python3 -m pytest tests/ -q"
+entitlements_file = ""
