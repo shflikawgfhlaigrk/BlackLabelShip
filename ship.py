@@ -432,9 +432,11 @@ def stage_manifest(cfg, name, build, version, sha, notary_id):
               "--file", mpath, "--remote"], cwd=SHIP_ROOT)
     if r.returncode != 0:
         fail(f"manifest: upload failed: {(r.stderr or r.stdout).strip()[:300]}")
-    # re-fetch to confirm
+    # re-fetch to confirm (browser-like UA: Cloudflare 403s the default Python-urllib UA)
     import urllib.request
-    with urllib.request.urlopen(f"{SITE_URL}{cfg['manifest_endpoint']}", timeout=60) as resp:
+    _mreq = urllib.request.Request(f"{SITE_URL}{cfg['manifest_endpoint']}",
+                                   headers={"User-Agent": "Mozilla/5.0 (bl-ship manifest-confirm)"})
+    with urllib.request.urlopen(_mreq, timeout=60) as resp:
         live = json.load(resp)
     if live.get("sha256") != sha:
         fail(f"manifest: live re-fetch sha mismatch: {live.get('sha256', '?')[:16]} != {sha[:16]}")
