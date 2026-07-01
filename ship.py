@@ -307,7 +307,9 @@ R2_BUCKET = "sovereign-files"  # DOWNLOADS binding in worker/wrangler.worker.tom
 SITE_URL = "https://blacklabelbots.com"
 TEAM_ID = "745ZPGFRA5"
 NOTARY_PROFILE = os.environ.get("NOTARY_PROFILE", "BL_NOTARY")
-FORBIDDEN_CLAIMS = r"791,123|791123|82\.0%|648W|16-module|through-wall"
+# Fabrications only. NOT "through-wall" — that's an HONEST feature name when the page gates it behind
+# the ESP32/CSI hardware (homefront does). We ban invented figures + present-tense capability overclaims.
+FORBIDDEN_CLAIMS = r"791,123|791123|789,123|82\.0%|648W|648 wins|16-module|16 modules|16 signals|8 timeframes|2-of-8"
 
 
 def stage_preflight(cfg, name):
@@ -508,7 +510,10 @@ def cmd_site(dry_run):
     # forbidden-claims grep over every html at root
     hits = []
     for root, dirs, files in os.walk(dep):
-        dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "worker")]
+        # dist/ is regenerated from the source tree by package-for-cloudflare.sh at deploy time,
+        # so it's a stale mirror — scan SOURCE only (dist would false-flag pre-purge copies).
+        dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "worker", "dist",
+                                                ".wrangler", ".playwright-mcp", ".claude-flow")]
         for fn in files:
             if fn.endswith((".html", ".js")) and not fn.endswith(".min.js"):
                 p = os.path.join(root, fn)
