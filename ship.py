@@ -292,6 +292,231 @@ def live_verify(url, expected_sha, app_name):
     return None
 
 
+# ---------- stages ----------
+
+R2_BUCKET = "sovereign-files"  # DOWNLOADS binding in worker/wrangler.worker.toml
+SITE_URL = "https://blacklabelbots.com"
+TEAM_ID = "745ZPGFRA5"
+NOTARY_PROFILE = os.environ.get("NOTARY_PROFILE", "BL_NOTARY")
+FORBIDDEN_CLAIMS = r"791,123|791123|82\.0%|648W|16-module|through-wall"
+
+
+def stage_preflight(cfg, name):
+    repo = expand(cfg["repo"])
+    r = _run(["git", "-C", repo, "status", "--porcelain"])
+    dirty = [l for l in r.stdout.splitlines() if l.strip()]
+    if dirty:
+        fail(f"preflight: {name}: working tree dirty ({len(dirty)} entries) — commit first (provenance)")
+    head = _run(["git", "-C", repo, "rev-parse", "--short", "HEAD"]).stdout.strip()
+    print(f"  preflight: tree clean at {head}")
+    if cfg.get("test_cmd"):
+        print(f"  preflight: tests: {cfg['test_cmd']}")
+        r2 = subprocess.run(cfg["test_cmd"], shell=True, cwd=repo)
+        if r2.returncode != 0:
+            fail(f"preflight: {name}: tests failed (rc={r2.returncode})")
+        print("  preflight: tests PASS")
+    else:
+        print("  preflight: !! NO test_cmd configured — tests SKIPPED (loud)")
+    return head
+
+
+def stage_build(cfg, name):
+    repo = expand(cfg["repo"])
+    print(f"  build: {cfg['build_cmd']} (in {repo})")
+    r = subprocess.run(cfg["build_cmd"], shell=True, cwd=repo)
+    if r.returncode != 0:
+        fail(f"build: {name}: build_cmd failed (rc={r.returncode})")
+    app = expand(cfg["built_app_path"])
+    if not os.path.isabs(app):
+        app = os.path.join(repo, app)
+    if not os.path.isdir(app):
+        fail(f"build: built app not found at {app}")
+    print(f"  build: OK -> {app}")
+    return app
+
+
+def app_build_number(app_path):
+    info = os.path.join(app_path, "Contents", "Info.plist")
+    with open(info, "rb") as f:
+        pl = plistlib.load(f)
+    return str(pl.get("CFBundleVersion", "0")), str(pl.get("CFBundleShortVersionString", "0"))
+
+
+def stage_notarize(app_path, cfg, name):
+    """Submit no-wait + poll (beta-host `--wait` bus-errors), then staple."""
+    import time as _t
+    os.makedirs(WORK_DIR, exist_ok=True)
+    sub = os.path.join(WORK_DIR, f"{name}-notarize.zip")
+    if os.path.exists(sub):
+        os.unlink(sub)
+    r = _run(["ditto", "-c", "-k", "--keepParent", "--noextattr", app_path, sub])
+    if r.returncode != 0:
+        fail(f"notarize: zip failed: {r.stderr.strip()[:200]}")
+    r = _run(["xcrun", "notarytool", "submit", sub, "--keychain-profile", NOTARY_PROFILE,
+              "--no-wait", "--output-format", "json"])
+    if r.returncode != 0:
+        fail(f"notarize: submit failed: {(r.stderr or r.stdout).strip()[:300]}")
+    sid = json.loads(r.stdout)["id"]
+    print(f"  notarize: submitted id={sid}; polling…")
+    deadline = _t.time() + 45 * 60
+    status = "In Progress"
+    while _t.time() < deadline:
+        _t.sleep(30)
+        ri = _run(["xcrun", "notarytool", "info", sid, "--keychain-profile", NOTARY_PROFILE,
+                   "--output-format", "json"])
+        if ri.returncode != 0:
+            print(f"  notarize: poll error (transient): {(ri.stderr or ri.stdout).strip()[:120]}")
+            continue
+        status = json.loads(ri.stdout).get("status", "?")
+        print(f"  notarize: {status}")
+        if status not in ("In Progress",):
+            break
+    if status != "Accepted":
+        log = _run(["xcrun", "notarytool", "log", sid, "--keychain-profile", NOTARY_PROFILE])
+        fail(f"notarize: status={status}; log: {log.stdout[:800]}")
+    r = _run(["xcrun", "stapler", "staple", app_path])
+    if r.returncode != 0:
+        fail(f"notarize: staple failed: {(r.stdout or r.stderr).strip()[:200]}")
+    print(f"  notarize: Accepted + stapled (id={sid})")
+    return sid
+
+
+def stage_upload(zip_path, cfg, name, build):
+    keys = [cfg["r2_dl_key"], cfg["r2_updates_key"].replace("{build}", build)]
+    for k in keys:
+        r = _run(["npx", "wrangler", "r2", "object", "put", f"{R2_BUCKET}/{k}",
+                  "--file", zip_path, "--remote"], cwd=SHIP_ROOT)
+        if r.returncode != 0:
+            fail(f"upload: wrangler put {k} failed: {(r.stderr or r.stdout).strip()[:300]}")
+        print(f"  upload: r2 {R2_BUCKET}/{k} OK")
+    return keys
+
+
+def stage_manifest(cfg, name, build, version, sha, notary_id):
+    updates_key = cfg["r2_updates_key"].replace("{build}", build)
+    manifest = {
+        "product": name,
+        "latest_build": int(build) if build.isdigit() else build,
+        "latest_version": version,
+        "min_supported_build": 1,
+        "download_url": f"{SITE_URL}/{updates_key}",  # /updates/<...> serves R2 key updates/<...> 1:1
+        "sha256": sha,
+        "notarized": True,
+        "notarization_id": notary_id,
+        "team_id": TEAM_ID,
+        "published": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    mpath = os.path.join(WORK_DIR, f"{name}-manifest.json")
+    with open(mpath, "w") as f:
+        json.dump(manifest, f, indent=2)
+    r = _run(["npx", "wrangler", "r2", "object", "put", f"{R2_BUCKET}/version/{name}.json",
+              "--file", mpath, "--remote"], cwd=SHIP_ROOT)
+    if r.returncode != 0:
+        fail(f"manifest: upload failed: {(r.stderr or r.stdout).strip()[:300]}")
+    # re-fetch to confirm
+    import urllib.request
+    with urllib.request.urlopen(f"{SITE_URL}{cfg['manifest_endpoint']}", timeout=60) as resp:
+        live = json.load(resp)
+    if live.get("sha256") != sha:
+        fail(f"manifest: live re-fetch sha mismatch: {live.get('sha256', '?')[:16]} != {sha[:16]}")
+    print(f"  manifest: {cfg['manifest_endpoint']} live, sha confirmed")
+    return manifest
+
+
+def stage_ledger(name, head, build, sha, notary_id, dry_run):
+    line = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "app": name, "commit": head, "build": build, "sha256": sha,
+        "notarization_id": notary_id, "dry_run": dry_run,
+        "gates": [g.__name__ for g in LOCAL_GATES],
+    }
+    with open(LEDGER, "a") as f:
+        f.write(json.dumps(line) + "\n")
+    print(f"  ledger: appended to ships.jsonl")
+
+
+def cmd_ship(name, dry_run):
+    cfg_path = os.path.join(APPS_DIR, name + ".toml")
+    if not os.path.isfile(cfg_path):
+        fail(f"no config for app {name!r} ({cfg_path})")
+    cfg = validate(load_config(cfg_path), cfg_path)
+    print(f"== bl-ship {name} {'(DRY RUN)' if dry_run else ''} ==")
+    head = stage_preflight(cfg, name)
+    app = stage_build(cfg, name)
+    build, version = app_build_number(app)
+    notary_id = stage_notarize(app, cfg, name)
+    print("  gates:")
+    if not run_local_gates(app, cfg):
+        fail(f"{name}: local gates failed — nothing uploads")
+    os.makedirs(WORK_DIR, exist_ok=True)
+    zip_path = os.path.join(WORK_DIR, f"{name}.zip")
+    sha = pack(app, zip_path)
+    print(f"  pack: {zip_path} sha256={sha}")
+    if dry_run:
+        stage_ledger(name, head, build, sha, notary_id, True)
+        print(f"DRY RUN — not uploaded. ({name} build {build} v{version} ready)")
+        return 0
+    stage_upload(zip_path, cfg, name, build)
+    err = live_verify(cfg["dl_url"], sha, cfg["app_name"])
+    if err:
+        fail(f"{name}: {err} — manifest NOT bumped")
+    stage_manifest(cfg, name, build, version, sha, notary_id)
+    stage_ledger(name, head, build, sha, notary_id, False)
+    print(f"== SHIPPED {name} build {build} v{version} sha={sha[:16]}… ==")
+    return 0
+
+
+# ---------- site mode ----------
+
+def cmd_site(dry_run):
+    dep = expand("~/.blacklabelbots/_deploy")
+    print(f"== bl-ship site {'(DRY RUN)' if dry_run else ''} ==")
+    r = _run(["git", "-C", dep, "status", "--porcelain"])
+    dirty = [l for l in r.stdout.splitlines() if l.strip()]
+    if dirty:
+        fail(f"site: _deploy dirty ({len(dirty)} entries) — commit first (provenance)")
+    print("  site: tree committed")
+    gate = os.path.join(dep, "scripts", "check_no_fabricated_ledger.sh")
+    if os.path.isfile(gate):
+        r = subprocess.run(["bash", gate], cwd=dep, capture_output=True, text=True)
+        if r.returncode != 0:
+            fail(f"site: fabricated-ledger gate BLOCKED: {(r.stdout + r.stderr)[-400:]}")
+        print("  site: fabricated-ledger gate PASS")
+    else:
+        fail("site: check_no_fabricated_ledger.sh missing")
+    # forbidden-claims grep over every html at root
+    hits = []
+    for root, dirs, files in os.walk(dep):
+        dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "worker")]
+        for fn in files:
+            if fn.endswith((".html", ".js")) and not fn.endswith(".min.js"):
+                p = os.path.join(root, fn)
+                try:
+                    txt = open(p, encoding="utf-8", errors="ignore").read()
+                except OSError:
+                    continue
+                m = re.search(FORBIDDEN_CLAIMS, txt)
+                if m:
+                    hits.append(f"{os.path.relpath(p, dep)}: {m.group(0)}")
+    if hits:
+        fail("site: FORBIDDEN CLAIMS present:\n    " + "\n    ".join(hits[:20]))
+    print("  site: forbidden-claims grep clean")
+    if dry_run:
+        print("DRY RUN — not deployed.")
+        return 0
+    r = subprocess.run(["bash", os.path.join(dep, "scripts", "deploy-site-worker.sh")], cwd=dep)
+    if r.returncode != 0:
+        fail("site: deploy script failed")
+    import urllib.request
+    for path in ("/", "/pricing", "/trading"):
+        req = urllib.request.Request(SITE_URL + path, headers={"User-Agent": "bl-ship-site-gate"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            if resp.status != 200:
+                fail(f"site: live crawl {path} -> {resp.status}")
+    print("  site: live crawl OK (/, /pricing, /trading)")
+    return 0
+
+
 # ---------- cli ----------
 
 def main(argv):
@@ -307,7 +532,10 @@ def main(argv):
         cfg = validate(load_config(os.path.join(APPS_DIR, name + ".toml")),
                        os.path.join(APPS_DIR, name + ".toml"))
         return 0 if run_local_gates(app_path, cfg) else 1
-    fail(f"unknown command {argv[0]!r} (stages land in later tasks)")
+    dry = "--dry-run" in argv
+    if argv[0] == "site":
+        return cmd_site(dry)
+    return cmd_ship(argv[0], dry)
 
 
 if __name__ == "__main__":

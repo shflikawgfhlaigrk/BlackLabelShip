@@ -1,0 +1,1 @@
+{"ts": "2026-07-01T21:16:46.390374+00:00", "app": "sovereign", "commit": "36c846b", "build": "13", "sha256": "2f23b35afb0d617901bb7c12a8c15c5acd9863b61592515d1a5e92acd5c56dc1", "notarization_id": "72d7f8b5-5a60-46ef-8e42-28ab12f03a3a", "dry_run": true, "gates": ["gate_seal", "gate_entitlements", "gate_arch", "gate_ships_no_data", "gate_staple", "gate_gatekeeper"]}
