@@ -4,8 +4,8 @@
 repo = "~/BlackLabelMarketing"
 bundle_id = "com.blacklabel.marketing"
 app_name = "Black Label Marketing.app"
-build_cmd = "./build.command --devid --no-open"
-built_app_path = "build/release-provenance/Release/Black Label Marketing.app"
+build_cmd = "DERIVED_DATA_PATH=build/derived ./build.command --devid --no-open"
+built_app_path = "build/derived/Build/Products/Release/Black Label Marketing.app"
 arch = "universal2"
 required_entitlements = []
 forbidden_entitlements = ["com.apple.security.app-sandbox"]
