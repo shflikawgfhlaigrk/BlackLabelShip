@@ -3,7 +3,7 @@
 repo = "~/BlackLabelTrading"
 bundle_id = "com.blacklabel.trading"
 app_name = "Black Label Trading.app"
-build_cmd = "BUILD_NUMBER=6 ./build-developer-id.sh"
+build_cmd = "BUILD_NUMBER=8 ./build-developer-id.sh"
 built_app_path = "build/Black Label Trading.app"
 arch = "universal2"
 required_entitlements = ["com.apple.security.cs.disable-library-validation", "com.apple.security.network.client", "com.apple.security.cs.allow-dyld-environment-variables"]
