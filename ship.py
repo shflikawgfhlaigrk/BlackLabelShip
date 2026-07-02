@@ -466,6 +466,19 @@ def cmd_ship(name, dry_run):
     print(f"== bl-ship {name} {'(DRY RUN)' if dry_run else ''} ==")
     head = stage_preflight(cfg, name)
     app = stage_build(cfg, name)
+    # Stage the built .app into bl-ship's OWN work dir before the (minutes-long) notarize poll.
+    # The app repo's build dir has other writers (concurrent sessions, self-heal keepers, the
+    # sovereign self-builder) — a repo-side clean mid-poll yanked a staple once already.
+    os.makedirs(WORK_DIR, exist_ok=True)
+    staged = os.path.join(WORK_DIR, f"{name}-stage", os.path.basename(app))
+    if os.path.isdir(os.path.dirname(staged)):
+        _run(["rm", "-rf", os.path.dirname(staged)])
+    os.makedirs(os.path.dirname(staged), exist_ok=True)
+    r = _run(["ditto", app, staged])
+    if r.returncode != 0:
+        fail(f"{name}: staging copy failed: {(r.stderr or r.stdout).strip()[:200]}")
+    print(f"  staged: {staged} (immune to app-repo build cleans)")
+    app = staged
     build, version = app_build_number(app)
     notary_id = stage_notarize(app, cfg, name)
     print("  gates:")
