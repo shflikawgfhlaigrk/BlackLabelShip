@@ -5,9 +5,9 @@
 # Homefront.entitlements (mic + camera + local-network — TCC prompts die without them).
 repo = "~/BlackLabelHome"
 bundle_id = "com.blacklabel.homefront"
-app_name = "Homefront.app"
+app_name = "Vigil.app"
 build_cmd = "SIGN_ID=05494FC15FB97F422400BC32DF6D67FC2D28855B ./build.sh"
-built_app_path = ".build-stage/Homefront.app"
+built_app_path = ".build-stage/Vigil.app"
 arch = "universal2"
 required_entitlements = ["com.apple.security.device.audio-input", "com.apple.security.device.camera", "com.apple.security.network.client", "com.apple.security.network.server", "com.apple.security.cs.disable-library-validation"]
 forbidden_entitlements = ["com.apple.security.app-sandbox"]
