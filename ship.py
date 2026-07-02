@@ -261,12 +261,38 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-def pack(app_path, zip_path):
+def pack(app_path, zip_path, app_key=None):
     if os.path.exists(zip_path):
         os.unlink(zip_path)
     r = _run(["ditto", "-c", "-k", "--keepParent", "--norsrc", "--noqtn", app_path, zip_path])
     if r.returncode != 0:
         fail(f"pack: ditto failed: {r.stderr.strip()[:200]}")
+    # Buyer README at archive root (inject_readme.py owns the copy text; the app
+    # bundle itself is never touched, so notarization/staple stay valid).
+    if app_key:
+        try:
+            import inject_readme
+            meta = inject_readme.APPS.get(app_key)
+            if meta:
+                cfg_min = {"app_name": os.path.basename(app_path)}
+                readme = inject_readme.TEMPLATE % {
+                    "title": meta["title"],
+                    "rule": "=" * len(meta["title"]),
+                    "app_name": cfg_min["app_name"],
+                    "first_run": meta["first_run"].rstrip(),
+                    "support": inject_readme.SUPPORT % {"updates": meta["updates"]},
+                }
+                rdir = os.path.join(WORK_DIR, f"{app_key}-readme")
+                os.makedirs(rdir, exist_ok=True)
+                rpath = os.path.join(rdir, "README.txt")
+                with open(rpath, "w") as f:
+                    f.write(readme)
+                rr = _run(["zip", "-j", zip_path, rpath])
+                if rr.returncode != 0:
+                    fail(f"pack: README inject failed: {rr.stderr.strip()[:200]}")
+                print("  pack: buyer README.txt bundled")
+        except ImportError:
+            print("  pack: WARNING inject_readme.py missing — shipping without buyer README")
     # AppleDouble guard
     r = _run(["zipinfo", "-1", zip_path])
     doubles = [l for l in r.stdout.splitlines() if os.path.basename(l).startswith("._")]
@@ -486,7 +512,7 @@ def cmd_ship(name, dry_run):
         fail(f"{name}: local gates failed — nothing uploads")
     os.makedirs(WORK_DIR, exist_ok=True)
     zip_path = os.path.join(WORK_DIR, f"{name}.zip")
-    sha = pack(app, zip_path)
+    sha = pack(app, zip_path, app_key=name)
     print(f"  pack: {zip_path} sha256={sha}")
     if dry_run:
         stage_ledger(name, head, build, sha, notary_id, True)
