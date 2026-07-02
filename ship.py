@@ -333,6 +333,35 @@ R2_BUCKET = "sovereign-files"  # DOWNLOADS binding in worker/wrangler.worker.tom
 SITE_URL = "https://blacklabelbots.com"
 TEAM_ID = "745ZPGFRA5"
 NOTARY_PROFILE = os.environ.get("NOTARY_PROFILE", "BL_NOTARY")
+NOTARY_SECRETS = os.path.expanduser("~/.utah/secrets/notary.json")
+
+
+def _notary_auth():
+    """notarytool auth args, robust to the fragile login-keychain profile.
+
+    Prefer the stored `--keychain-profile` when it actually resolves; otherwise
+    fall back to inline App Store Connect API key creds from notary.json
+    (key_path/key_id/issuer). The BL_NOTARY keychain item has repeatedly gone
+    missing between ships (store-credentials needs an interactive keychain), so
+    a ship must never hard-depend on it. Returns (args, label)."""
+    have_profile = _run([
+        "security", "find-generic-password",
+        "-s", f"com.apple.gke.notary.tool.saved-creds.{NOTARY_PROFILE}",
+    ]).returncode == 0
+    if have_profile:
+        return (["--keychain-profile", NOTARY_PROFILE], f"keychain:{NOTARY_PROFILE}")
+    try:
+        with open(NOTARY_SECRETS) as f:
+            d = json.load(f)
+        key = os.path.expanduser(d["key_path"])
+        if os.path.exists(key) and d.get("key_id") and d.get("issuer"):
+            return (["--key", key, "--key-id", d["key_id"], "--issuer", d["issuer"]],
+                    "inline-apikey")
+    except (OSError, ValueError, KeyError):
+        pass
+    fail(f"notarize: no auth — keychain profile {NOTARY_PROFILE} missing AND "
+         f"{NOTARY_SECRETS} unusable. Re-run `xcrun notarytool store-credentials "
+         f"{NOTARY_PROFILE}` or fix notary.json.")
 # Fabrications only. NOT "through-wall" — that's an HONEST feature name when the page gates it behind
 # the ESP32/CSI hardware (homefront does). We ban invented figures + present-tense capability overclaims.
 FORBIDDEN_CLAIMS = r"791,123|791123|789,123|82\.0%|648W|648 wins|16-module|16 modules|16 signals|8 timeframes|2-of-8"
@@ -389,9 +418,11 @@ def stage_notarize(app_path, cfg, name):
     r = _run(["ditto", "-c", "-k", "--keepParent", "--noextattr", app_path, sub])
     if r.returncode != 0:
         fail(f"notarize: zip failed: {r.stderr.strip()[:200]}")
+    auth, auth_label = _notary_auth()
+    print(f"  notarize: auth via {auth_label}")
     sid = None
     for attempt in range(1, 4):
-        r = _run(["xcrun", "notarytool", "submit", sub, "--keychain-profile", NOTARY_PROFILE,
+        r = _run(["xcrun", "notarytool", "submit", sub, *auth,
                   "--no-wait", "--output-format", "json"])
         if r.returncode == 0 and r.stdout.strip():
             try:
@@ -409,7 +440,7 @@ def stage_notarize(app_path, cfg, name):
     status = "In Progress"
     while _t.time() < deadline:
         _t.sleep(30)
-        ri = _run(["xcrun", "notarytool", "info", sid, "--keychain-profile", NOTARY_PROFILE,
+        ri = _run(["xcrun", "notarytool", "info", sid, *auth,
                    "--output-format", "json"])
         if ri.returncode != 0:
             print(f"  notarize: poll error (transient): {(ri.stderr or ri.stdout).strip()[:120]}")
@@ -419,7 +450,7 @@ def stage_notarize(app_path, cfg, name):
         if status not in ("In Progress",):
             break
     if status != "Accepted":
-        log = _run(["xcrun", "notarytool", "log", sid, "--keychain-profile", NOTARY_PROFILE])
+        log = _run(["xcrun", "notarytool", "log", sid, *auth])
         fail(f"notarize: status={status}; log: {log.stdout[:800]}")
     r = _run(["xcrun", "stapler", "staple", app_path])
     if r.returncode != 0:
