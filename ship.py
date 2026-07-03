@@ -368,6 +368,12 @@ FORBIDDEN_CLAIMS = r"791,123|791123|789,123|82\.0%|648W|648 wins|16-module|16 mo
 
 
 def stage_preflight(cfg, name):
+    hold = os.path.join(APPS_DIR, f"{name}.HOLD")
+    if os.path.exists(hold):
+        with open(hold) as f:
+            why = f.read().strip()
+        fail(f"HOLD: shipping {name} is Founder-blocked — {why or 'see HOLD file'} "
+             f"(remove {hold} only on Founder's word)")
     repo = expand(cfg["repo"])
     r = _run(["git", "-C", repo, "status", "--porcelain"])
     dirty = [l for l in r.stdout.splitlines() if l.strip()]
