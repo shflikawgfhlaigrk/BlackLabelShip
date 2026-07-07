@@ -1,0 +1,70 @@
+# Circuit — WINDOWS lane (STAGED-ONLY, written 2026-07-08 on branch windows-lane-20260708)
+# =============================================================================
+# This is the Windows sibling of apps/circuit.toml. It rides the SAME ship.py
+# spine but a SEPARATE, fail-closed road (`ship.py --windows circuit-windows`).
+#
+# HARD LAW (enforced in code, not just docs):
+#   signing_identity absent OR == "UNSIGNED"  →  the road STOPS at the signing
+#   gate. The artifact is staged to work/ with a -UNSIGNED-STAGED suffix, its
+#   sha256 is recorded to ships-staged.jsonl, and it is IMPOSSIBLE for it to
+#   reach the public R2 /dl key or the live version manifest. An unsigned
+#   Windows download = "Windows protected your PC" on first run = a worse lie
+#   than no Windows app. So: unsigned never ships. Period.
+#
+# WHY circuit first: per PLANS/expansion-20260707/01-windows-downloads.md Circuit
+# is Tier D (already cross-platform: Node server + browser UI + analyzer; only a
+# 241-line Swift launcher is Apple-locked). It is the shell spike and the first
+# Windows download in one.
+#
+# The `platform = "windows"` key routes this file to the Windows validator +
+# Windows road. The Mac loader (load_all / --self-check) skips platform!=native
+# files, so this config never false-trips the macOS entitlement/arch schema.
+# =============================================================================
+
+platform = "windows"
+repo = "~/Circuit"
+bundle_id = "com.blacklabel.circuit"
+app_name = "Circuit-Setup.exe"
+
+# --- build: two modes, selected by ship.py --build-mode {ci-pull|rig} -------
+# ci-pull  (DEFAULT while no local hypervisor exists — see STATE/reports/windows-rig-20260708.md):
+#          pull a prebuilt artifact from a GitHub Actions windows-latest run.
+#          `{run}` is substituted with --run <id> (or the latest successful run
+#          of the named workflow when omitted). This runs TODAY.
+# rig      the on-Mac Windows VM path — BLOCKED until a hypervisor is restored
+#          (Founder gate). Documented so the flip is a one-liner later.
+build_mode_default = "ci-pull"
+build_cmd_ci = "gh run download {run} --repo blacklabelbots/circuit --name circuit-windows --dir {out}"
+build_cmd_rig = "prlctl exec 'Windows 11' powershell -File C:\\build\\circuit\\build.ps1"
+ci_workflow = "windows-build.yml"
+ci_artifact_name = "circuit-windows"
+
+# where the built/pulled installer lands inside the pulled/produced artifact dir
+built_artifact_windows = "Circuit-Setup.exe"
+
+# --- signing (FOUNDER GATE — money). UNSIGNED => STAGED-ONLY hard stop. ------
+# When a cert exists, set signing_identity to the cert thumbprint / subject and
+# signtool signs every nested .exe/.dll (bundled Node) + the installer. Until
+# then this is literally the string "UNSIGNED" and the road cannot pass gates.
+signing_identity = "UNSIGNED"
+sign_cmd = "signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /sha1 {thumbprint} {artifact}"
+
+# --- gauntlet steps (documented; ci-pull mode SKIPS-WITH-REASON, no rig) -----
+# Defender scan: real command for when a rig exists; in ci-pull mode it is
+# skipped and the skip is recorded (can't scan on a Mac; no Windows Defender).
+defender_scan_cmd = "powershell -Command \"Start-MpScan -ScanType CustomScan -ScanPath {artifact}\""
+# Clean-buyer gauntlet: restore the clean-buyer VM snapshot, download the LIVE
+# url, sha==ledger, SmartScreen behavior recorded, install, first-run, uninstall
+# leaves no orphan. BLOCKED ON RIG (no snapshot exists — rig report). Documented.
+clean_buyer_gauntlet_cmd = "prlctl snapshot-switch 'Windows 11' --name clean-buyer  # then manual gauntlet per PLAN §gauntlet"
+
+# --- publish targets (NEVER written while signing_identity == UNSIGNED) ------
+r2_dl_key_windows = "dl/circuit-windows.zip"
+r2_updates_key_windows = "updates/circuit-windows/{build}.zip"
+manifest_endpoint_windows = "/api/version/circuit-windows"
+dl_url_windows = "https://blacklabelbots.com/dl/circuit-windows.zip?k=c76acb879e8fe0d8d69a9b081e01758d"
+
+# ledger line carries platform:"windows". staged_only:true while UNSIGNED
+# (recorded to ships-staged.jsonl); a signed ship records staged_only:false to
+# ships.jsonl through the shared spine.
+ports = ["8923"]
