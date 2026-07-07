@@ -1,0 +1,20 @@
+# Circuit - Developer-ID lane (staged 2026-07-07)
+# Native launcher is universal2 so Intel Macs get an honest Apple Silicon requirement dialog.
+# Bundled Node runtime is arm64-only by design; no system Node fallback ships.
+# build.command signs inside-out: Node first with allow-jit for V8, then the app with empty ents.
+repo = "~/Circuit"
+bundle_id = "com.blacklabel.circuit"
+app_name = "Circuit.app"
+build_cmd = "SIGN_IDENTITY=05494FC15FB97F422400BC32DF6D67FC2D28855B ./build.command"
+built_app_path = "build/Circuit.app"
+arch = "arm64"
+required_entitlements = []
+forbidden_entitlements = ["com.apple.security.app-sandbox", "com.apple.security.cs.disable-library-validation", "com.apple.security.cs.allow-dyld-environment-variables", "com.apple.security.get-task-allow"]
+ships_no_data_globs = ["*.sqlite", "*.sqlite3", "*.db", "*.csv", "*.pem", "*.key", "*.tokens", "*secrets*", "*.env", "*recent*", "*history*", ".circuit*"]
+r2_dl_key = "circuit.zip"
+r2_updates_key = "updates/circuit/{build}.zip"
+manifest_endpoint = "/api/version/circuit"
+dl_url = "https://blacklabelbots.com/dl/circuit.zip?k=c76acb879e8fe0d8d69a9b081e01758d"
+ports = ["8923"]
+test_cmd = "npm test"
+entitlements_file = "macos/app.entitlements"

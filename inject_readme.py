@@ -141,6 +141,22 @@ HONEST NOTES
 """,
         "updates": UPD_DASH,
     },
+    "circuit": {
+        "title": "CIRCUIT",
+        "first_run": """FIRST RUN
+1. Open the app.
+2. Choose the repository you want Circuit to grade. A new install starts blank -
+   it does not ship with any repo history, paths, or customer data.
+3. Circuit starts a local grading server, opens the report in your default
+   browser, and stops the server when you quit the app.
+
+HONEST NOTES
+- Circuit grades the code you select on your Mac. It does not upload your repo,
+  include demo grades, or preload anyone else's project.
+- This build requires Apple Silicon because the bundled Node runtime is arm64.
+""",
+        "updates": UPD_DASH,
+    },
 }
 
 TEMPLATE = """%(title)s

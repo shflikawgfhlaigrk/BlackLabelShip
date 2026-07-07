@@ -458,8 +458,15 @@ def stage_notarize(app_path, cfg, name):
     if status != "Accepted":
         log = _run(["xcrun", "notarytool", "log", sid, *auth])
         fail(f"notarize: status={status}; log: {log.stdout[:800]}")
-    r = _run(["xcrun", "stapler", "staple", app_path])
-    if r.returncode != 0:
+    r = None
+    for attempt in range(1, 6):
+        r = _run(["xcrun", "stapler", "staple", app_path])
+        if r.returncode == 0:
+            break
+        detail = (r.stdout or r.stderr).strip()[:200]
+        print(f"  notarize: staple attempt {attempt} failed ({detail}); retrying…")
+        _t.sleep(30)
+    if r is None or r.returncode != 0:
         fail(f"notarize: staple failed: {(r.stdout or r.stderr).strip()[:200]}")
     print(f"  notarize: Accepted + stapled (id={sid})")
     return sid
