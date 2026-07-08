@@ -28,10 +28,11 @@ WIN_CFG = {
     "bundle_id": "com.blacklabel.circuit",
     "app_name": "Circuit-Setup.exe",
     "build_mode_default": "ci-pull",
-    "build_cmd_ci": "gh run download {run} --name circuit-windows --dir {out}",
-    "ci_workflow": "windows-build.yml",
-    "ci_artifact_name": "circuit-windows",
-    "built_artifact_windows": "Circuit-Setup.exe",
+    "build_cmd_ci": ("gh run download {run} --repo mthburnsbarber-web/BlackLabelCircuit "
+                     "--name circuit-windows-UNSIGNED-STAGED-ONLY --dir {out}"),
+    "ci_workflow": "windows-spike.yml",
+    "ci_artifact_name": "circuit-windows-UNSIGNED-STAGED-ONLY",
+    "built_artifact_windows": "circuit-windows-UNSIGNED-STAGED-ONLY.exe",
     "signing_identity": "UNSIGNED",
     "sign_cmd": "signtool sign /sha1 {thumbprint} {artifact}",
     "defender_scan_cmd": "Start-MpScan -ScanPath {artifact}",
@@ -51,7 +52,7 @@ class WindowsLaneTest(unittest.TestCase):
         self.work = os.path.join(self.tmp, "work")
         os.makedirs(self.work, exist_ok=True)
         # A fake built artifact win_build "produces".
-        self.artifact = os.path.join(self.work, "Circuit-Setup.exe")
+        self.artifact = os.path.join(self.work, "circuit-windows-UNSIGNED-STAGED-ONLY.exe")
         with open(self.artifact, "wb") as f:
             f.write(b"MZ\x90\x00fake-windows-installer-bytes")
         self.ledger = os.path.join(self.tmp, "ships.jsonl")
@@ -108,8 +109,10 @@ class WindowsLaneTest(unittest.TestCase):
         run.assert_not_called()
         sub.assert_not_called()
 
-        # A -UNSIGNED-STAGED artifact exists in work/.
-        staged = [f for f in os.listdir(self.work) if "UNSIGNED-STAGED" in f]
+        # A -UNSIGNED-STAGED artifact exists in work/. Match the exact staged
+        # suffix — the SOURCE artifact's own name now contains
+        # "UNSIGNED-STAGED-ONLY", so a substring match would count it too.
+        staged = [f for f in os.listdir(self.work) if f.endswith("-UNSIGNED-STAGED.exe")]
         self.assertEqual(len(staged), 1, f"expected one staged artifact, got {staged}")
 
         # Staging ledger written; ships.jsonl NOT touched.

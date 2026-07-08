@@ -34,13 +34,16 @@ app_name = "Circuit-Setup.exe"
 # rig      the on-Mac Windows VM path — BLOCKED until a hypervisor is restored
 #          (Founder gate). Documented so the flip is a one-liner later.
 build_mode_default = "ci-pull"
-build_cmd_ci = "gh run download {run} --repo blacklabelbots/circuit --name circuit-windows --dir {out}"
+# Verified 2026-07-08 against the real repo: latest green windows-spike.yml run
+# 28862877880 publishes artifact `circuit-windows-UNSIGNED-STAGED-ONLY`
+# containing `circuit-windows-UNSIGNED-STAGED-ONLY.exe` (+ sha/log sidecars).
+build_cmd_ci = "gh run download {run} --repo mthburnsbarber-web/BlackLabelCircuit --name circuit-windows-UNSIGNED-STAGED-ONLY --dir {out}"
 build_cmd_rig = "prlctl exec 'Windows 11' powershell -File C:\\build\\circuit\\build.ps1"
-ci_workflow = "windows-build.yml"
-ci_artifact_name = "circuit-windows"
+ci_workflow = "windows-spike.yml"
+ci_artifact_name = "circuit-windows-UNSIGNED-STAGED-ONLY"
 
 # where the built/pulled installer lands inside the pulled/produced artifact dir
-built_artifact_windows = "Circuit-Setup.exe"
+built_artifact_windows = "circuit-windows-UNSIGNED-STAGED-ONLY.exe"
 
 # --- signing (FOUNDER GATE — money). UNSIGNED => STAGED-ONLY hard stop. ------
 # When a cert exists, set signing_identity to the cert thumbprint / subject and

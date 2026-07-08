@@ -678,7 +678,14 @@ def win_build(cfg, name, build_mode, run_ref):
     # the caller passes --run; when omitted we resolve the latest successful run.
     if not run_ref:
         wf = cfg.get("ci_workflow", "")
-        rid = _run(["gh", "run", "list", "--repo", "blacklabelbots/circuit",
+        # The repo slug comes from the config's own build_cmd_ci (--repo <slug>),
+        # never a hardcoded default — a wrong slug here silently pulls another
+        # repo's runs. Fail closed if the template doesn't name one.
+        m = re.search(r"--repo\s+(\S+)", tmpl)
+        if not m:
+            fail(f"win-build: {name}: build_cmd_ci must carry --repo <owner/name> "
+                 "so the latest-run lookup targets the same repo as the download")
+        rid = _run(["gh", "run", "list", "--repo", m.group(1),
                     "--workflow", wf, "--status", "success", "--limit", "1",
                     "--json", "databaseId", "--jq", ".[0].databaseId"]).stdout.strip()
         if not rid:
