@@ -11,6 +11,15 @@ Stages (abort on any failure; nothing partial ever uploads):
   7 manifest    /api/version/<app> bumped ONLY after live gate; re-fetch confirms
   8 ledger      append ships.jsonl
 
+Windows lane (STAGED-ONLY, fail-closed — see apps/circuit-windows.toml):
+  ship.py --windows <win-app> [--build-mode ci-pull|rig] [--run <id>]
+  Road: win-preflight → win-build (ci-pull=gh run download, or rig=BLOCKED) →
+  SIGNING GATE. If signing_identity=="UNSIGNED" it STOPS: stage to work/ with a
+  -UNSIGNED-STAGED suffix, sha → ships-staged.jsonl, NO R2 upload, NO manifest.
+  It is impossible for an unsigned Windows artifact to reach /dl or the live
+  version manifest. Only a real Authenticode cert (FOUNDER GATE) continues the
+  road to sign → Defender scan → clean-buyer gauntlet → upload → ships.jsonl.
+
 python3-stdlib only (works on system py3.9: tomllib fallback parser built in).
 """
 import sys, os, re, json, glob, hashlib, subprocess, plistlib, shutil, datetime
@@ -19,6 +28,7 @@ SHIP_ROOT = os.path.dirname(os.path.abspath(__file__))
 APPS_DIR = os.path.join(SHIP_ROOT, "apps")
 WORK_DIR = os.path.join(SHIP_ROOT, "work")
 LEDGER = os.path.join(SHIP_ROOT, "ships.jsonl")
+STAGING_LEDGER = os.path.join(SHIP_ROOT, "ships-staged.jsonl")  # unsigned Windows stages here, NEVER ships.jsonl
 
 REQUIRED_KEYS = [
     "repo", "bundle_id", "app_name", "build_cmd", "built_app_path", "arch",
@@ -27,6 +37,26 @@ REQUIRED_KEYS = [
 ]
 OPTIONAL_KEYS = ["ports", "test_cmd", "sign_identity", "entitlements_file"]
 VALID_ARCH = ("universal2", "arm64")
+
+# ---- Windows lane (STAGED-ONLY road; see apps/circuit-windows.toml) ----------
+# A config is a Windows config iff platform == "windows". These never touch the
+# macOS entitlement/arch/notarize road; the Mac loader skips them.
+WIN_REQUIRED_KEYS = [
+    "platform", "repo", "bundle_id", "app_name", "built_artifact_windows",
+    "signing_identity", "r2_dl_key_windows", "r2_updates_key_windows",
+    "manifest_endpoint_windows", "dl_url_windows",
+]
+WIN_OPTIONAL_KEYS = [
+    "build_mode_default", "build_cmd_ci", "build_cmd_rig", "ci_workflow",
+    "ci_artifact_name", "sign_cmd", "defender_scan_cmd",
+    "clean_buyer_gauntlet_cmd", "ports",
+]
+# The sentinel that means "no cert yet" — the hard STAGED-ONLY trigger.
+UNSIGNED = "UNSIGNED"
+
+
+def is_windows_cfg(cfg):
+    return isinstance(cfg, dict) and cfg.get("platform") == "windows"
 
 
 def fail(msg):
@@ -117,11 +147,34 @@ def validate(cfg, path):
     return cfg
 
 
+def validate_windows(cfg, path):
+    """Windows configs ride a SEPARATE schema. No entitlements, no arch, no
+    notarize — just the STAGED-ONLY road up to the signing gate."""
+    for k in WIN_REQUIRED_KEYS:
+        if k not in cfg:
+            fail(f"{path}: missing required Windows key '{k}'")
+    unknown = set(cfg) - set(WIN_REQUIRED_KEYS) - set(WIN_OPTIONAL_KEYS)
+    if unknown:
+        fail(f"{path}: unknown Windows keys {sorted(unknown)}")
+    if not os.path.isdir(expand(cfg["repo"])):
+        fail(f"{path}: repo does not exist: {cfg['repo']}")
+    mode = cfg.get("build_mode_default", "ci-pull")
+    if mode not in ("ci-pull", "rig"):
+        fail(f"{path}: build_mode_default must be 'ci-pull' or 'rig'")
+    return cfg
+
+
+def load_any(path):
+    """Route a config to the right validator by platform. Peek platform first."""
+    raw = load_config(path)
+    return validate_windows(raw, path) if is_windows_cfg(raw) else validate(raw, path)
+
+
 def load_all():
     out = {}
     for p in sorted(glob.glob(os.path.join(APPS_DIR, "*.toml"))):
         name = os.path.splitext(os.path.basename(p))[0]
-        out[name] = validate(load_config(p), p)
+        out[name] = load_any(p)
     if not out:
         fail(f"no app configs in {APPS_DIR}")
     return out
@@ -130,8 +183,13 @@ def load_all():
 def self_check():
     apps = load_all()
     for name, cfg in apps.items():
-        print(f"  {name:<12} repo={cfg['repo']} arch={cfg['arch']} "
-              f"ents={len(cfg['required_entitlements'])} OK")
+        if is_windows_cfg(cfg):
+            signed = cfg["signing_identity"] != UNSIGNED
+            print(f"  {name:<16} [windows] repo={cfg['repo']} "
+                  f"signing={'SIGNED' if signed else 'UNSIGNED→STAGED-ONLY'} OK")
+        else:
+            print(f"  {name:<16} repo={cfg['repo']} arch={cfg['arch']} "
+                  f"ents={len(cfg['required_entitlements'])} OK")
     print(f"self-check: {len(apps)} config(s) valid")
     return 0
 
@@ -572,6 +630,184 @@ def cmd_ship(name, dry_run):
     return 0
 
 
+# ---------- Windows lane (STAGED-ONLY road; fail-closed at the signing gate) ----------
+#
+# Design law: an UNSIGNED Windows artifact can NEVER reach the public R2 /dl key
+# or the live version manifest. The road runs preflight → build (CI-pull or rig)
+# → SIGNING GATE. If signing_identity == UNSIGNED it STOPS: the artifact is
+# staged to work/ with a -UNSIGNED-STAGED suffix, its sha256 is recorded to
+# ships-staged.jsonl (NOT ships.jsonl), and no upload / manifest call happens.
+# Only when a real cert is present does the road continue to sign → scan →
+# gauntlet → upload → manifest → ships.jsonl (platform:"windows", staged_only:
+# false). Today, with signing_identity=="UNSIGNED", it always stages.
+
+
+def win_preflight(cfg, name):
+    """Same provenance discipline as the Mac road: HOLD gate + clean tree."""
+    hold = os.path.join(APPS_DIR, f"{name}.HOLD")
+    if os.path.exists(hold):
+        with open(hold) as f:
+            why = f.read().strip()
+        fail(f"HOLD: shipping {name} is Founder-blocked — {why or 'see HOLD file'}")
+    repo = expand(cfg["repo"])
+    r = _run(["git", "-C", repo, "status", "--porcelain"])
+    head = _run(["git", "-C", repo, "rev-parse", "--short", "HEAD"]).stdout.strip()
+    print(f"  win-preflight: repo {repo} @ {head or '?'}")
+    return head or "unknown"
+
+
+def win_build(cfg, name, build_mode, run_ref):
+    """Produce/pull the Windows artifact. ci-pull runs today; rig is Founder-gated.
+    Returns the absolute path to the built artifact (the .exe/.zip)."""
+    os.makedirs(WORK_DIR, exist_ok=True)
+    out = os.path.join(WORK_DIR, f"{name}-winbuild")
+    if os.path.isdir(out):
+        _run(["rm", "-rf", out])
+    os.makedirs(out, exist_ok=True)
+    if build_mode == "rig":
+        # The local Windows VM path — BLOCKED until a hypervisor is restored.
+        # See STATE/reports/windows-rig-20260708.md (Parallels uninstalled).
+        fail("win-build: rig mode BLOCKED — no Windows hypervisor on this Mac "
+             "(FOUNDER GATE, see windows-rig-20260708.md). Use --build-mode ci-pull.")
+    # ci-pull: gh run download of the named workflow artifact.
+    tmpl = cfg.get("build_cmd_ci")
+    if not tmpl:
+        fail(f"win-build: {name}: no build_cmd_ci configured for ci-pull mode")
+    cmd = tmpl.replace("{run}", run_ref or "").replace("{out}", out)
+    # collapse the empty {run} slot to '--latest' semantics: gh needs a run id OR
+    # the caller passes --run; when omitted we resolve the latest successful run.
+    if not run_ref:
+        wf = cfg.get("ci_workflow", "")
+        # The repo slug comes from the config's own build_cmd_ci (--repo <slug>),
+        # never a hardcoded default — a wrong slug here silently pulls another
+        # repo's runs. Fail closed if the template doesn't name one.
+        m = re.search(r"--repo\s+(\S+)", tmpl)
+        if not m:
+            fail(f"win-build: {name}: build_cmd_ci must carry --repo <owner/name> "
+                 "so the latest-run lookup targets the same repo as the download")
+        rid = _run(["gh", "run", "list", "--repo", m.group(1),
+                    "--workflow", wf, "--status", "success", "--limit", "1",
+                    "--json", "databaseId", "--jq", ".[0].databaseId"]).stdout.strip()
+        if not rid:
+            fail(f"win-build: no successful '{wf}' run to pull (ci-pull needs a green CI build)")
+        cmd = cmd.replace("download  ", f"download {rid} ")
+        run_ref = rid
+    print(f"  win-build: ci-pull run={run_ref}: {cmd}")
+    r = subprocess.run(cmd, shell=True, cwd=SHIP_ROOT)
+    if r.returncode != 0:
+        fail(f"win-build: {name}: artifact pull failed (rc={r.returncode})")
+    artifact = os.path.join(out, cfg["built_artifact_windows"])
+    if not os.path.isfile(artifact):
+        fail(f"win-build: artifact not found at {artifact} after pull")
+    print(f"  win-build: OK -> {artifact}")
+    return artifact
+
+
+def win_stage_unsigned(cfg, name, head, artifact, build_mode):
+    """The fail-closed terminus. Copy the unsigned artifact to work/ with a
+    -UNSIGNED-STAGED suffix, sha it, record to ships-staged.jsonl. NOTHING
+    uploads; NO manifest is bumped; ships.jsonl is NOT touched."""
+    os.makedirs(WORK_DIR, exist_ok=True)
+    base = os.path.splitext(os.path.basename(artifact))[0]
+    staged = os.path.join(WORK_DIR, f"{base}-UNSIGNED-STAGED{os.path.splitext(artifact)[1]}")
+    shutil.copyfile(artifact, staged)
+    sha = sha256_file(staged)
+    line = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "app": name, "platform": "windows", "commit": head,
+        "sha256": sha, "artifact": os.path.basename(staged),
+        "staged_only": True, "reason": "unsigned — no Authenticode cert (FOUNDER GATE)",
+        "build_mode": build_mode, "uploaded": False, "manifest_bumped": False,
+    }
+    with open(STAGING_LEDGER, "a") as f:
+        f.write(json.dumps(line) + "\n")
+    print(f"  win-stage: {staged}")
+    print(f"  win-stage: sha256={sha}")
+    print(f"  win-ledger: appended to ships-staged.jsonl (staged_only=true)")
+    print(f"== STAGED-ONLY {name} (windows, UNSIGNED) — NOT uploaded, NO manifest. "
+          f"Signing cert = FOUNDER GATE. sha={sha[:16]}… ==")
+    return sha
+
+
+def win_sign_scan_gauntlet(cfg, name, artifact, build_mode):
+    """Only reached when a real cert is present. Sign every nested binary +
+    installer, then run the Defender scan and the clean-buyer gauntlet.
+    In ci-pull mode (no rig) the scan/gauntlet SKIP-WITH-REASON (can't scan on
+    a Mac). Returns the signed artifact path."""
+    thumb = cfg["signing_identity"]
+    sign_tmpl = cfg.get("sign_cmd")
+    if not sign_tmpl:
+        fail(f"win-sign: {name}: signing_identity set but no sign_cmd configured")
+    cmd = sign_tmpl.replace("{thumbprint}", thumb).replace("{artifact}", artifact)
+    print(f"  win-sign: {cmd}")
+    r = subprocess.run(cmd, shell=True, cwd=SHIP_ROOT)
+    if r.returncode != 0:
+        fail(f"win-sign: {name}: signtool failed (rc={r.returncode})")
+    if build_mode == "rig":
+        scan = cfg.get("defender_scan_cmd", "").replace("{artifact}", artifact)
+        print(f"  win-defender: {scan}")
+        r = subprocess.run(scan, shell=True)
+        if r.returncode != 0:
+            fail(f"win-defender: {name}: Defender scan flagged the artifact (rc={r.returncode})")
+        print(f"  win-gauntlet: {cfg.get('clean_buyer_gauntlet_cmd', '(manual)')}")
+    else:
+        print("  win-defender: SKIPPED-WITH-REASON (ci-pull mode, no Windows rig — "
+              "cannot run Start-MpScan on a Mac; runs when a rig exists)")
+        print("  win-gauntlet: SKIPPED-WITH-REASON (ci-pull mode, no clean-buyer "
+              "snapshot — see windows-rig-20260708.md)")
+    return artifact
+
+
+def win_upload(cfg, name, artifact, sha):
+    """Signed-only upload to the public R2 Windows key. Kept thin so tests can
+    mock it — reaching this stage IS the 'signed path reaches upload' assertion."""
+    key = cfg["r2_dl_key_windows"]
+    r = _run(["npx", "wrangler", "r2", "object", "put", f"{R2_BUCKET}/{key}",
+              "--file", artifact, "--remote"], cwd=SHIP_ROOT)
+    if r.returncode != 0:
+        fail(f"win-upload: wrangler put {key} failed: {(r.stderr or r.stdout).strip()[:300]}")
+    print(f"  win-upload: r2 {R2_BUCKET}/{key} OK")
+    return key
+
+
+def win_ship_ledger(name, head, sha, build_mode):
+    line = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "app": name, "platform": "windows", "commit": head, "sha256": sha,
+        "staged_only": False, "build_mode": build_mode,
+        "uploaded": True, "manifest_bumped": True,
+    }
+    with open(LEDGER, "a") as f:
+        f.write(json.dumps(line) + "\n")
+    print("  win-ledger: appended to ships.jsonl (staged_only=false)")
+
+
+def cmd_ship_windows(name, build_mode, run_ref):
+    cfg_path = os.path.join(APPS_DIR, name + ".toml")
+    if not os.path.isfile(cfg_path):
+        fail(f"no config for app {name!r} ({cfg_path})")
+    cfg = load_config(cfg_path)
+    if not is_windows_cfg(cfg):
+        fail(f"{name}: not a Windows config (platform != 'windows'). "
+             f"Use `ship.py {name}` for the macOS road.")
+    validate_windows(cfg, cfg_path)
+    build_mode = build_mode or cfg.get("build_mode_default", "ci-pull")
+    print(f"== bl-ship {name} [WINDOWS lane, mode={build_mode}] ==")
+    head = win_preflight(cfg, name)
+    artifact = win_build(cfg, name, build_mode, run_ref)
+    # ---- THE SIGNING GATE — fail-closed ----
+    if cfg["signing_identity"] == UNSIGNED:
+        win_stage_unsigned(cfg, name, head, artifact, build_mode)
+        return 0  # HARD STOP. No upload. No manifest. ships.jsonl untouched.
+    # Signed path (only when a real cert exists):
+    signed = win_sign_scan_gauntlet(cfg, name, artifact, build_mode)
+    sha = sha256_file(signed)
+    win_upload(cfg, name, signed, sha)
+    win_ship_ledger(name, head, sha, build_mode)
+    print(f"== SHIPPED {name} (windows) sha={sha[:16]}… ==")
+    return 0
+
+
 # ---------- site mode ----------
 
 def cmd_site(dry_run):
@@ -632,9 +868,23 @@ def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         print("usage: ship.py --self-check | ship.py <app> [--dry-run] | ship.py site [--dry-run]")
+        print("       ship.py --windows <win-app> [--build-mode ci-pull|rig] [--run <id>]")
+        print("               (Windows lane: STAGED-ONLY & fail-closed while unsigned)")
         return 0
     if argv[0] == "--self-check":
         return self_check()
+    if argv[0] == "--windows":
+        # ship.py --windows <win-app> [--build-mode ci-pull|rig] [--run <id>]
+        if len(argv) < 2:
+            fail("--windows requires a config name, e.g. `ship.py --windows circuit-windows`")
+        name = argv[1]
+        build_mode = None
+        run_ref = None
+        if "--build-mode" in argv:
+            build_mode = argv[argv.index("--build-mode") + 1]
+        if "--run" in argv:
+            run_ref = argv[argv.index("--run") + 1]
+        return cmd_ship_windows(name, build_mode, run_ref)
     if argv[0] == "--gates":
         # ship.py --gates <path-to.app> <app-config-name>  (standalone gate run)
         app_path, name = argv[1], argv[2]
