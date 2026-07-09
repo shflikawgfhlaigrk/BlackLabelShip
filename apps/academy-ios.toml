@@ -1,0 +1,22 @@
+# Black Label Academy — iOS App Store lane (STAGED-ONLY, fail-closed).
+# Read by ci/ios_lane.py (NOT ship.py — this is the iOS road, platform="ios").
+# The RELEASE-Xcode IPA is produced by the GitHub Actions workflow
+# .github/workflows/ios-release.yml on macos-15 (Apple-accepted Xcode 16.x),
+# clearing the beta 26.6/17F113 host stamp. This config only tells the LOCAL
+# road how to PULL that artifact and stage it fail-closed.
+#
+# signing_identity = "UNSIGNED" -> ios_lane STAGES ONLY: copies the pulled IPA to
+# work/academy-ios-UNSIGNED-STAGED-ONLY.ipa, shas it, appends ONE line to
+# ships-staged.jsonl. NOTHING uploads; ships.jsonl is NOT written. Distribution
+# signing + the App Store submit are Michael money/Apple gates (team 745ZPGFRA5).
+platform = "ios"
+repo = "~/BlackLabelAcademy"
+bundle_id = "com.blacklabel.academy"
+app_name = "BlackLabelAcademy"
+ci_workflow = "ios-release.yml"
+build_cmd_ci = "gh run download {run} --repo mthburnsbarber-web/BlackLabelAcademy --name academy-ios-UNSIGNED-STAGED-ONLY --dir {out}"
+ci_artifact_name = "academy-ios-UNSIGNED-STAGED-ONLY"
+built_artifact_ios = "academy-ios-UNSIGNED-STAGED-ONLY.ipa"
+signing_identity = "UNSIGNED"
+export_plist = "apps/ios-lane/ExportOptions-AppStore-iOS.plist"
+asc_app_id = "6783512097"

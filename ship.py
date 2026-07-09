@@ -59,6 +59,23 @@ def is_windows_cfg(cfg):
     return isinstance(cfg, dict) and cfg.get("platform") == "windows"
 
 
+# ---- iOS lane (STAGED-ONLY road; see apps/academy-ios.toml + ci/ios_lane.py) --
+# A config is an iOS config iff platform == "ios". These ride ci/ios_lane.py (the
+# RELEASE-Xcode GitHub Actions road), NOT ship.py's macOS notarize road, so the
+# Mac loader validates them lightly and otherwise skips them.
+IOS_REQUIRED_KEYS = [
+    "platform", "repo", "ci_workflow", "build_cmd_ci",
+    "built_artifact_ios", "signing_identity",
+]
+IOS_OPTIONAL_KEYS = [
+    "bundle_id", "app_name", "ci_artifact_name", "export_plist", "asc_app_id",
+]
+
+
+def is_ios_cfg(cfg):
+    return isinstance(cfg, dict) and cfg.get("platform") == "ios"
+
+
 def fail(msg):
     print(f"FAIL: {msg}")
     sys.exit(1)
@@ -164,10 +181,29 @@ def validate_windows(cfg, path):
     return cfg
 
 
+def validate_ios(cfg, path):
+    """iOS configs ride a SEPARATE schema (the ci/ios_lane.py road). No
+    entitlements, no arch, no notarize — just the STAGED-ONLY ci-pull road up to
+    the signing/upload boundary (owner gate)."""
+    for k in IOS_REQUIRED_KEYS:
+        if k not in cfg:
+            fail(f"{path}: missing required iOS key '{k}'")
+    unknown = set(cfg) - set(IOS_REQUIRED_KEYS) - set(IOS_OPTIONAL_KEYS)
+    if unknown:
+        fail(f"{path}: unknown iOS keys {sorted(unknown)}")
+    if not os.path.isdir(expand(cfg["repo"])):
+        fail(f"{path}: repo does not exist: {cfg['repo']}")
+    return cfg
+
+
 def load_any(path):
     """Route a config to the right validator by platform. Peek platform first."""
     raw = load_config(path)
-    return validate_windows(raw, path) if is_windows_cfg(raw) else validate(raw, path)
+    if is_windows_cfg(raw):
+        return validate_windows(raw, path)
+    if is_ios_cfg(raw):
+        return validate_ios(raw, path)
+    return validate(raw, path)
 
 
 def load_all():
@@ -186,6 +222,10 @@ def self_check():
         if is_windows_cfg(cfg):
             signed = cfg["signing_identity"] != UNSIGNED
             print(f"  {name:<16} [windows] repo={cfg['repo']} "
+                  f"signing={'SIGNED' if signed else 'UNSIGNED→STAGED-ONLY'} OK")
+        elif is_ios_cfg(cfg):
+            signed = cfg["signing_identity"] != UNSIGNED
+            print(f"  {name:<16} [ios]     repo={cfg['repo']} "
                   f"signing={'SIGNED' if signed else 'UNSIGNED→STAGED-ONLY'} OK")
         else:
             print(f"  {name:<16} repo={cfg['repo']} arch={cfg['arch']} "
