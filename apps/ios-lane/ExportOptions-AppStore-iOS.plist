@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Export an iOS .xcarchive to an .ipa for upload to App Store Connect / TestFlight.
+     Use with: xcodebuild -exportArchive -archivePath X.xcarchive \
+                 -exportPath out -exportOptionsPlist ExportOptions-AppStore-iOS.plist \
+                 -allowProvisioningUpdates -->
+<plist version="1.0">
+<dict>
+  <key>method</key>            <string>app-store-connect</string>
+  <key>destination</key>       <string>export</string>
+  <key>teamID</key>            <string>745ZPGFRA5</string>
+  <key>signingStyle</key>      <string>automatic</string>
+  <key>generateAppStoreInformation</key> <true/>
+  <key>uploadSymbols</key>     <true/>
+</dict>
+</plist>

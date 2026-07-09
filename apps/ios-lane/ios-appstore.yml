@@ -1,0 +1,225 @@
+# iOS App Store lane — shared GitHub Actions macOS-runner + RELEASE-Xcode
+# archive/export lane. Clears the single shared root cause behind the six
+# INVALID_BINARY states: the beta Xcode 26.6 / build 17F113 host stamp. The Mac
+# workstation is on macOS 27 beta (26A*) with only Xcode 26.6 beta (17F113), so
+# every locally-archived binary carries the Apple-rejected fingerprint. A
+# GitHub-hosted macOS runner ships Apple-ACCEPTED RELEASE Xcodes; this lane
+# selects one, proves it with the shared guard, and fails CLOSED otherwise.
+#
+# FAIL-CLOSED CONTRACT (mirrors the ~/BlackLabelShip Windows lane):
+#   * guard rejects (beta / Xcode 27.* / 17F113 / macOS 26A) -> job FAILS, no artifact.
+#   * no distribution signing wired (default) -> produce a
+#     <slug>-ios-UNSIGNED-STAGED-ONLY.ipa artifact, guard-check it, STOP. No upload.
+#   * signing wired (owner sets repo var IOS_SIGNING_READY=true) -> export an
+#     upload-ready signed IPA and STOP at the upload boundary. The transport to
+#     App Store Connect fires ONLY when repo var IOS_CONFIRM_UPLOAD=1 (owner gate).
+#
+# PER-REPO REUSE: Stage-2 engineers copy this file to .github/workflows/, copy
+# ci/appstore_toolchain_guard.sh + ci/ExportOptions-AppStore-iOS.plist +
+# ci/ios_lane.py + ci/test_ios_lane.py into ci/, and edit the four env values below.
+name: ios-appstore
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "macOS runner image"
+        required: false
+        default: "macos-15"
+  push:
+    branches: ['**']
+    paths:
+      - '.github/workflows/ios-appstore.yml'
+      - 'ci/**'
+      - 'project.yml'
+      - 'Sources/**'
+
+# ---- per-repo knobs: Stage-2 edits ONLY these four lines ----
+env:
+  APP_NAME: HomefrontGuardian
+  SCHEME: HomefrontGuardian
+  PROJECT: HomefrontGuardian.xcodeproj
+  ARTIFACT_SLUG: homefrontguardian
+
+jobs:
+  archive:
+    # macos-15 ships Apple-accepted RELEASE Xcodes (16.x). Never a self-hosted
+    # runner (that would reintroduce the beta host). Overridable via dispatch input.
+    runs-on: ${{ github.event.inputs.runner || 'macos-15' }}
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # STEP 1 — DISCOVER the runner toolchain (the empirical answer the lane exists for).
+      - name: Discover toolchains
+        run: |
+          set -eo pipefail
+          echo "== runner host =="
+          sw_vers
+          echo "== installed Xcodes =="
+          ls -d /Applications/Xcode*.app 2>/dev/null || echo "(none)"
+          for x in /Applications/Xcode*.app; do
+            [ -d "$x" ] || continue
+            echo "---- $x ----"
+            "$x/Contents/Developer/usr/bin/xcodebuild" -version 2>/dev/null || echo "  (xcodebuild failed)"
+          done
+
+      # STEP 2 — SELECT a RELEASE Xcode and run the shared guard. FAILS CLOSED.
+      - name: Select release Xcode + guard
+        run: |
+          set -eo pipefail
+          source ci/appstore_toolchain_guard.sh
+          best=""
+          # Highest version first; skip anything whose PATH marks it a beta.
+          for dd in $(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V -r); do
+            case "$dd" in *-beta*|*Xcode-beta.app) echo "skip beta-by-path: $dd"; continue;; esac
+            v="$("$dd/Contents/Developer/usr/bin/xcodebuild" -version 2>/dev/null | head -1)"
+            case "$v" in *"Xcode 27."*) echo "skip Xcode 27 beta: $dd ($v)"; continue;; esac
+            best="$dd/Contents/Developer"
+            echo "candidate release Xcode: $dd ($v)"
+            break
+          done
+          if [ -z "$best" ]; then
+            echo "::error::No RELEASE Xcode found on runner — cannot clear the beta fingerprint. FAIL CLOSED."
+            exit 65
+          fi
+          export APPSTORE_DEVELOPER_DIR="$best"
+          # The guard exits 65 on beta / 27.* / 17F113 / macOS 26A host.
+          appstore_select_xcode
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          SEL="$("$DEVELOPER_DIR/usr/bin/xcodebuild" -version | tr '\n' ' ')"
+          echo "SELECTED_XCODE=$SEL" >> "$GITHUB_ENV"
+          echo "### Selected Xcode" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$SEL" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install xcodegen
+        run: |
+          set -eo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      # STEP 3 — regenerate the pbxproj (committed pbxproj drifts) and archive.
+      - name: Generate project
+        run: |
+          set -eo pipefail
+          xcodegen generate
+
+      - name: Archive (unsigned, RELEASE config)
+        run: |
+          set -eo pipefail
+          rm -rf build
+          # Log to cwd (build/ is created by xcodebuild; teeing into it before it
+          # exists would fail). Capture xcodebuild's own rc via PIPESTATUS.
+          set +e
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/${APP_NAME}.xcarchive \
+            archive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            2>&1 | tee archive.log | tail -40
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "== archive xcodebuild rc=$rc =="
+          if [ "$rc" -ne 0 ]; then echo "::error::archive failed (rc=$rc)"; exit "$rc"; fi
+          grep -q "ARCHIVE SUCCEEDED" archive.log || { echo "::error::no ARCHIVE SUCCEEDED marker"; exit 1; }
+          echo "ARCHIVE SUCCEEDED present"
+
+      # STEP 4a — DEFAULT fail-closed terminus: package an UNSIGNED staged IPA.
+      - name: Package UNSIGNED staged IPA
+        if: ${{ vars.IOS_SIGNING_READY != 'true' }}
+        run: |
+          set -eo pipefail
+          APP=$(ls -d build/${APP_NAME}.xcarchive/Products/Applications/*.app 2>/dev/null | head -1)
+          if [ -z "$APP" ]; then echo "::error::no .app in archive"; exit 1; fi
+          rm -rf export && mkdir -p export/Payload
+          cp -R "$APP" export/Payload/
+          IPA="${ARTIFACT_SLUG}-ios-UNSIGNED-STAGED-ONLY.ipa"
+          ( cd export && zip -qry "../$IPA" Payload )
+          echo "IPA=$IPA" >> "$GITHUB_ENV"
+          echo "staged unsigned IPA: $IPA ($(du -h "$IPA" | cut -f1))"
+
+      # STEP 4b — SIGNED path (owner-gated): export an upload-ready IPA, STOP at boundary.
+      - name: Export SIGNED upload-ready IPA (owner-gated)
+        if: ${{ vars.IOS_SIGNING_READY == 'true' }}
+        run: |
+          set -eo pipefail
+          rm -rf export && mkdir -p export
+          xcodebuild -exportArchive \
+            -archivePath build/${APP_NAME}.xcarchive \
+            -exportPath export \
+            -exportOptionsPlist ci/ExportOptions-AppStore-iOS.plist \
+            -allowProvisioningUpdates \
+            2>&1 | tee export/export.log | tail -40
+          IPA=$(ls export/*.ipa | head -1)
+          echo "IPA=$IPA" >> "$GITHUB_ENV"
+          echo "signed upload-ready IPA: $IPA"
+
+      # STEP 5 — guard-check the produced IPA + print the provenance fingerprint.
+      - name: Guard-check IPA + print DTXcodeBuild
+        run: |
+          set -eo pipefail
+          source ci/appstore_toolchain_guard.sh
+          # Fails CLOSED (exit 65) if the IPA carries 17F113 / DTXcode>=2700 / macOS 26A.
+          appstore_check_ipa "$IPA"
+          rm -rf _pl && mkdir -p _pl
+          unzip -oq "$IPA" 'Payload/*.app/Info.plist' -d _pl
+          PL=$(ls _pl/Payload/*.app/Info.plist | head -1)
+          DTB=$(/usr/libexec/PlistBuddy -c 'Print :DTXcodeBuild' "$PL" 2>/dev/null || echo "?")
+          DTX=$(/usr/libexec/PlistBuddy -c 'Print :DTXcode' "$PL" 2>/dev/null || echo "?")
+          BMO=$(/usr/libexec/PlistBuddy -c 'Print :BuildMachineOSBuild' "$PL" 2>/dev/null || echo "?")
+          DTS=$(/usr/libexec/PlistBuddy -c 'Print :DTSDKBuild' "$PL" 2>/dev/null || echo "?")
+          {
+            echo "### IPA provenance (the make-or-break answer)"
+            echo '```'
+            echo "IPA=$IPA"
+            echo "DTXcodeBuild=$DTB   (17F113 == the Apple-rejected beta; anything else == cleared)"
+            echo "DTXcode=$DTX"
+            echo "DTSDKBuild=$DTS"
+            echo "BuildMachineOSBuild=$BMO"
+            echo "SELECTED_XCODE=$SELECTED_XCODE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "DTXcodeBuild=$DTB DTXcode=$DTX DTSDKBuild=$DTS BuildMachineOSBuild=$BMO"
+          printf 'IPA=%s\nDTXcodeBuild=%s\nDTXcode=%s\nDTSDKBuild=%s\nBuildMachineOSBuild=%s\nSELECTED_XCODE=%s\n' \
+            "$IPA" "$DTB" "$DTX" "$DTS" "$BMO" "$SELECTED_XCODE" > provenance.txt
+
+      # STEP 6 — prove the fail-closed decision core in CI too.
+      - name: Fail-closed self-check (ios_lane test)
+        run: |
+          set -eo pipefail
+          python3 ci/test_ios_lane.py
+
+      # STEP 7 — publish the staged artifact + provenance for local pull / audit.
+      - name: Upload staged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_SLUG }}-ios-UNSIGNED-STAGED-ONLY
+          path: |
+            ${{ env.IPA }}
+            provenance.txt
+          if-no-files-found: error
+
+      # STEP 8 — the upload boundary. Transport ONLY on the double owner gate.
+      - name: Upload to App Store Connect (double owner gate)
+        if: ${{ vars.IOS_SIGNING_READY == 'true' && vars.IOS_CONFIRM_UPLOAD == '1' }}
+        env:
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER: ${{ secrets.ASC_API_ISSUER }}
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+        run: |
+          set -eo pipefail
+          echo "OWNER GATE OPEN (IOS_SIGNING_READY=true, IOS_CONFIRM_UPLOAD=1) — transporting $IPA"
+          mkdir -p ~/private_keys
+          printf '%s' "$ASC_API_KEY_P8" > ~/private_keys/AuthKey_${ASC_API_KEY_ID}.p8
+          xcrun altool --upload-app -f "$IPA" -t ios \
+            --apiKey "$ASC_API_KEY_ID" --apiIssuer "$ASC_API_ISSUER"
