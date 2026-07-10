@@ -1,9 +1,11 @@
-# Black Label Sovereign — Developer-ID lane (values verified against repo 2026-07-01)
+# Black Label Sovereign — Developer-ID lane (built_app_path re-verified 2026-07-10:
+# build-developer-id.sh writes to ./build/developer-id since commit 3d8dc92 "Guard
+# canonical production installs" — the old /tmp/bls-devid path shipped a stale build.)
 repo = "~/BlackLabelSovereign"
 bundle_id = "com.blacklabel.sovereign"
 app_name = "Black Label Sovereign.app"
 build_cmd = "./build-developer-id.sh"
-built_app_path = "/tmp/bls-devid/Black Label Sovereign.app"
+built_app_path = "build/developer-id/Black Label Sovereign.app"
 arch = "universal2"
 required_entitlements = ["com.apple.security.personal-information.calendars"]
 forbidden_entitlements = ["com.apple.security.app-sandbox"]

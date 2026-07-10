@@ -73,10 +73,13 @@ HONEST NOTES
     "sovereign": {
         "title": "BLACK LABEL SOVEREIGN",
         "first_run": """FIRST RUN
-1. Open the app and sign in with YOUR OWN Claude account when prompted -
-   Sovereign runs on your login, so your conversations and memory stay yours.
-2. Voice: grant microphone permission when macOS asks ("Hey Ace" wake word +
-   push-to-talk both work after that).
+1. Open the app. A short setup does everything for you - it installs a free
+   private assistant that runs on your own Mac. No account, no API key, and
+   nothing to configure. (Optional, for the most powerful mode: connect your
+   own Claude account later in Settings > Brain.)
+2. Voice: grant microphone permission when macOS asks. During setup you name
+   your assistant and say the name three times to train it - after that, just
+   say the name to talk hands-free. Push-to-talk works too.
 3. Calendar features ask for calendar permission the first time you use them.
 
 HONEST NOTES
