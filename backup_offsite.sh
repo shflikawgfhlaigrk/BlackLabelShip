@@ -67,4 +67,16 @@ else
 fi
 
 rm -rf "$WORK"
+log "state bundle complete: $KEY ($SZ)"
+
+# 7. Off-site the restore-proven snapshot set (large pg dumps + brain-state).
+#    Separate lane (chunked, integrity-manifested) — its failure must not sink the
+#    state-bundle success above, but its rc is surfaced in the log.
+if [[ -x "$HOME/BlackLabelShip/backup_offsite_snapshot.sh" ]]; then
+  if bash "$HOME/BlackLabelShip/backup_offsite_snapshot.sh"; then
+    log "restore-proven snapshot off-site OK"
+  else
+    log "WARN: restore-proven snapshot off-site returned non-zero (see snapshot: lines)"
+  fi
+fi
 log "backup complete: $KEY ($SZ)"
