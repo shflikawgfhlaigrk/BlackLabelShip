@@ -193,6 +193,37 @@ def _truth_fresh(max_age_h: float = 2.0) -> bool:
         return False
 
 
+def _discord_feeds_ok(hooks_path: pathlib.Path | None = None,
+                      expected_path: pathlib.Path | None = None) -> bool:
+    """2026-07-12: all 8 utah Discord feed webhooks silently pointed at ONE channel
+    (#ops-alerts), so the leads finder flooded the alert channel with 100 posts/day.
+    Guard both failure modes: each webhook must still resolve to the channel pinned in
+    discord_webhooks.expected.json (re-pin after any deliberate rewire), and no two
+    feeds may share a channel. Missing files, missing keys, or dead webhooks are RED."""
+    secrets = pathlib.Path.home() / ".utah" / "secrets"
+    hooks_path = hooks_path or secrets / "discord_webhooks.json"
+    expected_path = expected_path or secrets / "discord_webhooks.expected.json"
+    try:
+        hooks = json.loads(hooks_path.read_text())
+        expected = json.loads(expected_path.read_text())
+    except Exception:
+        return False
+    if not expected or set(hooks) != set(expected):
+        return False
+    seen: dict[str, str] = {}
+    for key, url in hooks.items():
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "blb-healthcheck"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                channel = json.load(r).get("channel_id", "")
+        except Exception:
+            return False  # deleted/unreachable webhook: posts vanish silently otherwise
+        if channel != expected[key] or channel in seen:
+            return False
+        seen[channel] = key
+    return True
+
+
 def run(force_fail: bool = False) -> dict:
     checks: dict[str, bool] = {}
     for u in SITES:
@@ -202,6 +233,7 @@ def run(force_fail: bool = False) -> dict:
     checks["backup <26h"] = _backup_fresh()
     checks["truth.json <2h"] = _truth_fresh()
     checks["realestate onboarding smoke"] = _realestate_smoke_ok()
+    checks["discord feed routing"] = _discord_feeds_ok()
     _automation_checks(checks)
     if force_fail:
         checks["SYNTHETIC forced-fail (alert drill)"] = False
