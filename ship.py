@@ -29,6 +29,14 @@ APPS_DIR = os.path.join(SHIP_ROOT, "apps")
 WORK_DIR = os.path.join(SHIP_ROOT, "work")
 LEDGER = os.path.join(SHIP_ROOT, "ships.jsonl")
 STAGING_LEDGER = os.path.join(SHIP_ROOT, "ships-staged.jsonl")  # unsigned Windows stages here, NEVER ships.jsonl
+# A REHEARSAL IS NOT A SHIP. --dry-run used to append `{"dry_run": true, ...}` straight into
+# ships.jsonl; 7 such rows are in there now. ships.jsonl is the ship-OF-RECORD, and its consumers
+# (healthcheck, the status file, anything doing `tail -1`) read a row as "this shipped". A rehearsal
+# row is therefore the same hazard as a correction row: it reads as a ship that never happened. The
+# last train had to archive the 6 rows its dry-runs wrote and hand-restore the ledger — a file you
+# have to repair after every rehearsal is a file that will eventually be repaired wrong. Dry runs
+# now land here instead, and ships.jsonl is only ever touched by a real, GO-authorized publish.
+DRY_LEDGER = os.path.join(SHIP_ROOT, "ships-dryrun.jsonl")
 
 REQUIRED_KEYS = [
     "repo", "bundle_id", "app_name", "build_cmd", "built_app_path", "arch",
@@ -576,6 +584,84 @@ def gate_provenance(app_path, name, expect_commit=None):
     return data["commit"]
 
 
+# ---------- the build number must be NEW, or the ship is inert ----------
+# Caught on circuit 2026-07-12, and it is a silent total-delivery failure, not a bookkeeping nit.
+# Circuit b4 (commit bd96996) shipped at 11:38. The CI-25 fix landed at 7b785bc — but that tree still
+# stamps CFBundleVersion 4. So the road happily built, notarized and gated an artifact carrying REAL
+# new code under an ALREADY-SHIPPED build number. Had it published:
+#   · the in-app updater keys on CFBundleVersion, so every existing b4 user is told they are current —
+#     the fix reaches NOBODY, while every gate stays green and the ledger says "shipped";
+#   · ships.jsonl ends up with two `circuit b4` rows carrying DIFFERENT sha256s, so the ledger can no
+#     longer answer "what is b4?" — the same attribution rot the provenance gate exists to end.
+# A ship that cannot be installed is not a ship. Re-publishing the SAME bytes is fine (resuming a dead
+# train); re-publishing DIFFERENT bytes under the same number is not.
+def _shipped_rows(name, build):
+    if not os.path.isfile(LEDGER):
+        return []
+    rows = []
+    with open(LEDGER) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("app") == name and str(r.get("build")) == str(build) and not r.get("dry_run"):
+                rows.append(r)
+    return rows
+
+
+def gate_build_number(name, build, sha=None):
+    """FAIL CLOSED if this build number already shipped with different bytes."""
+    prior = _shipped_rows(name, build)
+    if not prior:
+        return
+    if sha is not None and all(p.get("sha256") == sha for p in prior):
+        print(f"  gate_build_number: build {build} already shipped with these EXACT bytes — "
+              f"idempotent re-publish, OK")
+        return
+    p = prior[-1]
+    fail(f"{name}: BUILD NUMBER {build} ALREADY SHIPPED (commit {p.get('commit')}, sha "
+         f"{str(p.get('sha256'))[:16]}…, {str(p.get('ts'))[:19]}) and these are DIFFERENT bytes. "
+         f"The in-app updater keys on CFBundleVersion, so republishing {build} would tell every "
+         f"existing {build} user they are already current — the new code would reach NOBODY, and "
+         f"ships.jsonl would carry two different {build} rows. Bump CFBundleVersion in the app repo "
+         f"and rebuild. Refusing to ship an update nobody can install.")
+
+
+# ---------- the founder GO: publishing is an owner-only act (CHARTER §3) ----------
+# A ship is irreversible — the bytes go public, the manifest bumps, buyers auto-update. §3 makes that
+# Michael's call, but until now the gate was HONOR-SYSTEM: nothing in the road stopped an agent that
+# talked itself into "he'd obviously want this". A gate that lives only in a prompt is not a gate.
+#
+# So the GO is now an ARTIFACT. apps/<app>.GO must exist and be non-empty; the road reads it, records
+# it in the ledger row, and fail-closes without it. It is the mirror image of the HOLD file: HOLD says
+# "never", GO says "this one, now". Absence of GO is NOT permission — it is refusal.
+#
+# Placed immediately after gate_provenance so a rehearsal still PROVES the bytes carry their commit
+# (the expensive, interesting check) and only then stops at the owner's door — writing nothing.
+GO_SUFFIX = ".GO"
+
+
+def gate_go(name):
+    """FAIL CLOSED unless the founder has explicitly authorized publishing THIS app."""
+    go = os.path.join(APPS_DIR, name + GO_SUFFIX)
+    if not os.path.isfile(go):
+        fail(f"NO GO: publishing {name} is an owner-only act (CHARTER §3) and there is no "
+             f"{os.path.basename(go)}. The artifact is built, gated and provenance-bound — it is "
+             f"READY, not authorized. Michael creates {go} with his word to release it. "
+             f"Refusing to publish on my own say-so.")
+    with open(go) as f:
+        word = f.read().strip()
+    if not word:
+        fail(f"NO GO: {os.path.basename(go)} is empty — an empty file is not an authorization. "
+             f"It must carry the founder's word.")
+    print(f"  gate_go: founder GO on file for {name} ({word.splitlines()[0][:60]})")
+    return word.splitlines()[0][:120]
+
+
 def stage_notarize(app_path, cfg, name):
     """Submit no-wait + poll (beta-host `--wait` bus-errors), then staple."""
     import time as _t
@@ -678,16 +764,19 @@ def stage_manifest(cfg, name, build, version, sha, notary_id):
     return manifest
 
 
-def stage_ledger(name, head, build, sha, notary_id, dry_run):
+def stage_ledger(name, head, build, sha, notary_id, dry_run, go=None):
     line = {
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "app": name, "commit": head, "build": build, "sha256": sha,
         "notarization_id": notary_id, "dry_run": dry_run,
         "gates": [g.__name__ for g in LOCAL_GATES],
     }
-    with open(LEDGER, "a") as f:
+    if go:
+        line["go"] = go
+    target = DRY_LEDGER if dry_run else LEDGER
+    with open(target, "a") as f:
         f.write(json.dumps(line) + "\n")
-    print(f"  ledger: appended to ships.jsonl")
+    print(f"  ledger: appended to {os.path.basename(target)}")
 
 
 def cmd_publish_staged(name, notary_id, dry_run):
@@ -725,14 +814,18 @@ def cmd_publish_staged(name, notary_id, dry_run):
 
     print("  gates:")
     head = gate_provenance(app, name)
+    go = gate_go(name)
     if not run_local_gates(app, cfg):
         fail(f"{name}: local gates failed — nothing uploads")
 
     zip_path = os.path.join(WORK_DIR, f"{name}.zip")
     sha = pack(app, zip_path, app_key=name)
     print(f"  pack: {zip_path} sha256={sha}")
+    # Here the sha IS known, so an idempotent resume (same bytes, dead train) is allowed through
+    # while a same-number/different-bytes republish is refused.
+    gate_build_number(name, build, sha)
     if dry_run:
-        stage_ledger(name, head, build, sha, notary_id, True)
+        stage_ledger(name, head, build, sha, notary_id, True, go)
         print(f"DRY RUN — not uploaded. ({name} build {build} v{version} ready)")
         return 0
 
@@ -741,7 +834,7 @@ def cmd_publish_staged(name, notary_id, dry_run):
     if err:
         fail(f"{name}: {err} — manifest NOT bumped")
     stage_manifest(cfg, name, build, version, sha, notary_id)
-    stage_ledger(name, head, build, sha, notary_id, False)
+    stage_ledger(name, head, build, sha, notary_id, False, go)
     print(f"== SHIPPED {name} build {build} v{version} sha={sha[:16]}… ==")
     return 0
 
@@ -768,6 +861,10 @@ def cmd_ship(name, dry_run):
     print(f"  staged: {staged} (immune to app-repo build cleans)")
     app = staged
     build, version = app_build_number(app)
+    # Fail FAST, before the minutes-long notarize: a full rebuild always produces new bytes, so if
+    # this build number already shipped, the artifact is dead on arrival no matter how green the
+    # gates go. (No sha yet — and none is needed: rebuilt bytes are never the shipped bytes.)
+    gate_build_number(name, build)
     # Stamp the commit onto the bytes NOW, while we know for certain which source produced them.
     stage_provenance(app, name, head)
     notary_id = stage_notarize(app, cfg, name)
@@ -775,12 +872,13 @@ def cmd_ship(name, dry_run):
     if not run_local_gates(app, cfg):
         fail(f"{name}: local gates failed — nothing uploads")
     head = gate_provenance(app, name, head)
+    go = gate_go(name)
     os.makedirs(WORK_DIR, exist_ok=True)
     zip_path = os.path.join(WORK_DIR, f"{name}.zip")
     sha = pack(app, zip_path, app_key=name)
     print(f"  pack: {zip_path} sha256={sha}")
     if dry_run:
-        stage_ledger(name, head, build, sha, notary_id, True)
+        stage_ledger(name, head, build, sha, notary_id, True, go)
         print(f"DRY RUN — not uploaded. ({name} build {build} v{version} ready)")
         return 0
     stage_upload(zip_path, cfg, name, build)
@@ -788,7 +886,7 @@ def cmd_ship(name, dry_run):
     if err:
         fail(f"{name}: {err} — manifest NOT bumped")
     stage_manifest(cfg, name, build, version, sha, notary_id)
-    stage_ledger(name, head, build, sha, notary_id, False)
+    stage_ledger(name, head, build, sha, notary_id, False, go)
     print(f"== SHIPPED {name} build {build} v{version} sha={sha[:16]}… ==")
     return 0
 
