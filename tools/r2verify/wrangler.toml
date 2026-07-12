@@ -1,0 +1,10 @@
+name = "bl-r2verify"
+main = "worker.js"
+compatibility_date = "2026-07-01"
+workers_dev = true
+
+# Read path for the off-site backup restore-proof. Deployed and DELETED per verification run
+# (see backup_offsite_verify.sh) — a reader for encrypted backup objects must not be left standing.
+[[r2_buckets]]
+binding = "BACKUPS"
+bucket_name = "blacklabel-backups"

@@ -291,14 +291,17 @@ def gate_entitlements(app_path, cfg):
 
 
 def gate_ships_no_data(app_path, cfg):
-    """Flag buyer DATA/secrets in the bundle. Buyer data is never Python/interpreter SOURCE, so
-    skip .py/.pyc/__pycache__ — otherwise a bundled interpreter's own stdlib (e.g. secrets.py,
-    this_module.py) false-trips the `*secrets*`-style name globs. Real leaks are data files:
-    .sqlite/.db/.csv/.pem/.key/.env/tokens/named dumps."""
+    """Flag buyer DATA/secrets in the bundle. Buyer data is never SOURCE, so skip source
+    extensions and __pycache__ — otherwise a bundled interpreter's own stdlib (e.g. secrets.py,
+    this_module.py) or a Node app's own modules (e.g. Circuit's lib/history.js, the CI-20
+    grade-over-git-history feature) false-trip the `*secrets*`/`*history*` name globs. Real leaks
+    are data files: .sqlite/.db/.csv/.pem/.key/.env/tokens/named dumps — those still trip, whatever
+    they are named, because none of them carry a source extension."""
     import fnmatch
     hits = []
     pats = [p.lower() for p in cfg["ships_no_data_globs"]]
-    SOURCE_EXT = (".py", ".pyc", ".pyi", ".pyo")
+    SOURCE_EXT = (".py", ".pyc", ".pyi", ".pyo",
+                  ".js", ".mjs", ".cjs", ".ts", ".map")
     for root, dirs, files in os.walk(app_path):
         dirs[:] = [d for d in dirs if d != "__pycache__"]
         for fn in files:
@@ -512,6 +515,67 @@ def app_build_number(app_path):
     return str(pl.get("CFBundleVersion", "0")), str(pl.get("CFBundleShortVersionString", "0"))
 
 
+# ---------- provenance: bind the recorded commit to the packed BYTES ----------
+# THE b38 DEFECT. cmd_publish_staged read `git rev-parse HEAD` at PUBLISH time and stamped it onto an
+# artifact built hours earlier. Sovereign b38: the bytes were built from 30e740f, the ledger recorded
+# 34569a1 — so two features were credited to buyers who never received them. `git HEAD` describes the
+# TREE RIGHT NOW; it says nothing about the bytes sitting in work/<app>-stage. The commit therefore has
+# to travel WITH the artifact, not be re-derived from the repo at publish time.
+#
+# stage_provenance() stamps {commit, exec_sha256} beside the staged .app at BUILD time, when the commit
+# is known for certain. gate_provenance() then reads the commit from THERE and re-hashes the executable
+# to prove the stamp still describes these exact bytes. A stale or swapped artifact cannot pass: no
+# stamp -> fail; hash drift -> fail; tree moved mid-build -> fail.
+#
+# The stamp lives beside the bundle, not inside it: the .app is already codesigned by the build script,
+# and adding a file under Contents/ would break the seal (gate_seal would reject it).
+PROVENANCE = "provenance.json"
+
+
+def _exec_path(app_path):
+    info = os.path.join(app_path, "Contents", "Info.plist")
+    with open(info, "rb") as f:
+        pl = plistlib.load(f)
+    return os.path.join(app_path, "Contents", "MacOS", pl["CFBundleExecutable"])
+
+
+def stage_provenance(app_path, name, head):
+    """Stamp the build-time commit + executable hash beside the staged .app."""
+    data = {
+        "app": name, "commit": head,
+        "exec_sha256": sha256_file(_exec_path(app_path)),
+        "built": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    with open(os.path.join(os.path.dirname(app_path), PROVENANCE), "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"  provenance: commit {head} bound to exec sha {data['exec_sha256'][:16]}…")
+    return data
+
+
+def gate_provenance(app_path, name, expect_commit=None):
+    """FAIL CLOSED unless the packed bytes provably carry the commit we are about to record."""
+    prov = os.path.join(os.path.dirname(app_path), PROVENANCE)
+    if not os.path.isfile(prov):
+        fail(f"{name}: no {PROVENANCE} beside the staged artifact — the commit these bytes were built "
+             f"from is UNKNOWN. (This is the b38 shape: an artifact staged before the provenance gate, "
+             f"or hand-placed.) Rebuild with `ship.py {name}` so the commit is stamped at build time. "
+             f"Refusing to guess it from git HEAD.")
+    with open(prov) as f:
+        data = json.load(f)
+    if data.get("app") != name:
+        fail(f"{name}: provenance describes app {data.get('app')!r} — the wrong artifact is staged.")
+    actual = sha256_file(_exec_path(app_path))
+    if data.get("exec_sha256") != actual:
+        fail(f"{name}: provenance/artifact MISMATCH — {PROVENANCE} describes an executable hashing to "
+             f"{str(data.get('exec_sha256'))[:16]}… but the staged binary hashes to {actual[:16]}…. The "
+             f"artifact was rebuilt or swapped after it was stamped; refusing to ship it as {data.get('commit')}.")
+    if expect_commit and data["commit"] != expect_commit:
+        fail(f"{name}: the tree moved during the build — the bytes carry {data['commit']} but HEAD is now "
+             f"{expect_commit}. Rebuild from a settled tree so the ledger cannot lie about the commit.")
+    print(f"  gate_provenance: bytes provably carry commit {data['commit']} (exec sha verified) OK")
+    return data["commit"]
+
+
 def stage_notarize(app_path, cfg, name):
     """Submit no-wait + poll (beta-host `--wait` bus-errors), then staple."""
     import time as _t
@@ -626,6 +690,62 @@ def stage_ledger(name, head, build, sha, notary_id, dry_run):
     print(f"  ledger: appended to ships.jsonl")
 
 
+def cmd_publish_staged(name, notary_id, dry_run):
+    """Resume the road at stage 4 for an artifact already built+notarized+stapled.
+
+    The train can die between notarize (minutes-long, Apple-side) and upload; the
+    staged .app in work/<name>-stage carries its notarization ticket, so rebuilding
+    would only produce a DIFFERENT unnotarized binary. This re-enters the SAME road:
+    local gates -> pack -> upload -> live gate -> manifest -> ledger. Nothing is
+    skipped that protects a buyer: gate_staple and gate_gatekeeper still run, and
+    the live gate still re-downloads and Gatekeeper-checks the quarantined copy.
+    An artifact that is not already stapled CANNOT publish here -- it fails the gate.
+    """
+    cfg_path = os.path.join(APPS_DIR, name + ".toml")
+    if not os.path.isfile(cfg_path):
+        fail(f"no config for app {name!r} ({cfg_path})")
+    cfg = validate(load_config(cfg_path), cfg_path)
+    print(f"== bl-ship {name} PUBLISH-STAGED (no rebuild) {'(DRY RUN)' if dry_run else ''} ==")
+
+    hold = os.path.join(APPS_DIR, f"{name}.HOLD")
+    if os.path.exists(hold):
+        with open(hold) as f:
+            why = f.read().strip()
+        fail(f"HOLD: shipping {name} is Founder-blocked — {why or 'see HOLD file'}")
+
+    app = os.path.join(WORK_DIR, f"{name}-stage", cfg["app_name"])
+    if not os.path.isdir(app):
+        fail(f"{name}: no staged artifact at {app} — run the full road instead")
+    # THE b38 FIX. This used to be `git rev-parse HEAD` — the commit of the tree RIGHT NOW, which has
+    # nothing to do with the artifact staged hours ago. That is exactly how sovereign b38 got stamped
+    # 34569a1 while its bytes were built from 30e740f. Read the commit from the artifact's own
+    # build-time provenance instead, and fail closed if the bytes don't back it up.
+    build, version = app_build_number(app)
+    print(f"  staged: {app} (build {build} v{version})")
+
+    print("  gates:")
+    head = gate_provenance(app, name)
+    if not run_local_gates(app, cfg):
+        fail(f"{name}: local gates failed — nothing uploads")
+
+    zip_path = os.path.join(WORK_DIR, f"{name}.zip")
+    sha = pack(app, zip_path, app_key=name)
+    print(f"  pack: {zip_path} sha256={sha}")
+    if dry_run:
+        stage_ledger(name, head, build, sha, notary_id, True)
+        print(f"DRY RUN — not uploaded. ({name} build {build} v{version} ready)")
+        return 0
+
+    stage_upload(zip_path, cfg, name, build)
+    err = live_verify(cfg["dl_url"], sha, cfg["app_name"])
+    if err:
+        fail(f"{name}: {err} — manifest NOT bumped")
+    stage_manifest(cfg, name, build, version, sha, notary_id)
+    stage_ledger(name, head, build, sha, notary_id, False)
+    print(f"== SHIPPED {name} build {build} v{version} sha={sha[:16]}… ==")
+    return 0
+
+
 def cmd_ship(name, dry_run):
     cfg_path = os.path.join(APPS_DIR, name + ".toml")
     if not os.path.isfile(cfg_path):
@@ -648,10 +768,13 @@ def cmd_ship(name, dry_run):
     print(f"  staged: {staged} (immune to app-repo build cleans)")
     app = staged
     build, version = app_build_number(app)
+    # Stamp the commit onto the bytes NOW, while we know for certain which source produced them.
+    stage_provenance(app, name, head)
     notary_id = stage_notarize(app, cfg, name)
     print("  gates:")
     if not run_local_gates(app, cfg):
         fail(f"{name}: local gates failed — nothing uploads")
+    head = gate_provenance(app, name, head)
     os.makedirs(WORK_DIR, exist_ok=True)
     zip_path = os.path.join(WORK_DIR, f"{name}.zip")
     sha = pack(app, zip_path, app_key=name)
@@ -925,6 +1048,15 @@ def main(argv):
         if "--run" in argv:
             run_ref = argv[argv.index("--run") + 1]
         return cmd_ship_windows(name, build_mode, run_ref)
+    if argv[0] == "--publish-staged":
+        # ship.py --publish-staged <app> --notary-id <id> [--dry-run]
+        if len(argv) < 2:
+            fail("--publish-staged requires an app, e.g. `ship.py --publish-staged marketing`")
+        name = argv[1]
+        if "--notary-id" not in argv:
+            fail("--publish-staged requires --notary-id <submission-id> (provenance for the ledger)")
+        nid = argv[argv.index("--notary-id") + 1]
+        return cmd_publish_staged(name, nid, "--dry-run" in argv)
     if argv[0] == "--gates":
         # ship.py --gates <path-to.app> <app-config-name>  (standalone gate run)
         app_path, name = argv[1], argv[2]
