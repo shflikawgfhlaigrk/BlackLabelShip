@@ -1031,13 +1031,15 @@ def win_upload(cfg, name, artifact, sha):
     return key
 
 
-def win_ship_ledger(name, head, sha, build_mode):
+def win_ship_ledger(name, head, sha, build_mode, go=None):
     line = {
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "app": name, "platform": "windows", "commit": head, "sha256": sha,
         "staged_only": False, "build_mode": build_mode,
         "uploaded": True, "manifest_bumped": True,
     }
+    if go:
+        line["go"] = go
     with open(LEDGER, "a") as f:
         f.write(json.dumps(line) + "\n")
     print("  win-ledger: appended to ships.jsonl (staged_only=false)")
@@ -1060,11 +1062,15 @@ def cmd_ship_windows(name, build_mode, run_ref):
     if cfg["signing_identity"] == UNSIGNED:
         win_stage_unsigned(cfg, name, head, artifact, build_mode)
         return 0  # HARD STOP. No upload. No manifest. ships.jsonl untouched.
-    # Signed path (only when a real cert exists):
+    # Signed path (only when a real cert exists). Publishing to the public R2 key + ships.jsonl is
+    # the same owner-only, irreversible act the Mac roads gate — so it is gated the same way. The GO
+    # is required BEFORE the public upload; absence is refusal, not permission (CHARTER §3). Without
+    # this, cmd_ship_windows was a third road into the ship-of-record that no gate_go guarded.
+    go = gate_go(name)
     signed = win_sign_scan_gauntlet(cfg, name, artifact, build_mode)
     sha = sha256_file(signed)
     win_upload(cfg, name, signed, sha)
-    win_ship_ledger(name, head, sha, build_mode)
+    win_ship_ledger(name, head, sha, build_mode, go)
     print(f"== SHIPPED {name} (windows) sha={sha[:16]}… ==")
     return 0
 

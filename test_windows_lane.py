@@ -125,10 +125,14 @@ class WindowsLaneTest(unittest.TestCase):
         self.assertEqual(len(self._lines(self.ledger)), 0,
                          "ships.jsonl must NOT be written for an unsigned artifact")
 
-    # ---- (b) signed identity present -> reaches upload stage ----
+    # ---- (b) signed identity present + founder GO -> reaches upload stage ----
     def test_signed_reaches_upload_and_ships_ledger(self):
         self._write_cfg("circuit-windows",
                         {"signing_identity": "AA11BB22CC33DEADBEEFCERTTHUMBPRINT"})
+        # A signed publish goes public + writes ships.jsonl — an owner-only act (CHARTER §3), so it
+        # needs the founder GO artifact just like the Mac roads. Provide it (APPS_DIR is the sandbox).
+        with open(os.path.join(self.tmp, "circuit-windows.GO"), "w") as f:
+            f.write("GO — ship circuit windows b5. Michael, 2026-07-14\n")
         # Mock the externals (signtool/Defender/wrangler) so the road can run
         # end-to-end without a Windows box; reaching win_upload IS the assertion.
         with mock.patch.object(ship, "win_upload",
@@ -140,13 +144,33 @@ class WindowsLaneTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         up.assert_called_once()  # the signed path reached the (mocked) upload stage
 
-        # ships.jsonl gets the real ship line; staging ledger untouched.
+        # ships.jsonl gets the real ship line (with the recorded GO); staging ledger untouched.
         led = self._lines(self.ledger)
         self.assertEqual(len(led), 1)
         self.assertEqual(led[0]["platform"], "windows")
         self.assertFalse(led[0]["staged_only"])
         self.assertTrue(led[0]["uploaded"])
+        self.assertTrue(led[0]["go"].startswith("GO — ship circuit windows b5"))
         self.assertEqual(len(self._lines(self.staging)), 0)
+
+    # ---- (b2) signed identity but NO founder GO -> fail-closed, nothing public ----
+    def test_signed_without_go_refuses_and_never_uploads(self):
+        self._write_cfg("circuit-windows",
+                        {"signing_identity": "AA11BB22CC33DEADBEEFCERTTHUMBPRINT"})
+        # No circuit-windows.GO in the sandbox APPS_DIR. The signed path must STOP before any public
+        # upload or ledger write — a cert is not authorization to publish.
+        with mock.patch.object(ship, "win_upload") as up, \
+             mock.patch.object(ship, "win_sign_scan_gauntlet") as sign, \
+             mock.patch("subprocess.run",
+                        return_value=mock.Mock(returncode=0)):
+            with self.assertRaises(SystemExit) as cm:
+                ship.cmd_ship_windows("circuit-windows", None, None)
+
+        self.assertNotEqual(cm.exception.code, 0)
+        up.assert_not_called()   # no public bytes
+        sign.assert_not_called()  # gate_go runs before signing
+        self.assertEqual(len(self._lines(self.ledger)), 0,
+                         "ships.jsonl must NOT be written without a founder GO")
 
     # ---- guard: rig mode is Founder-gated (blocked) ----
     def test_rig_mode_blocked(self):

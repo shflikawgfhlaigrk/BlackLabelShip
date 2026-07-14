@@ -210,9 +210,26 @@ def test_both_publish_paths_are_build_number_gated():
 
 
 def test_both_publish_paths_are_go_gated():
-    """Neither road may reach an upload or a ledger write without passing gate_go."""
+    """NO road may reach a public upload or a ledger write without passing gate_go.
+
+    cmd_ship_windows is the third road: its signed path uploads to the public R2 Windows key and
+    appends to ships.jsonl (win_ship_ledger). It is unreachable while signing_identity==UNSIGNED,
+    but the moment a cert lands it becomes a full publish — so it is held to the same owner-gate as
+    the Mac roads. (The UNSIGNED path hard-stops to ships-staged and never publishes, so it needs no
+    GO; only the signed path that actually goes public must carry one.)
+    """
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ship.py")).read()
-    for fn in ("cmd_ship", "cmd_publish_staged"):
+    for fn in ("cmd_ship", "cmd_publish_staged", "cmd_ship_windows"):
         body = src.split(f"def {fn}")[1].split("\ndef ")[0]
         code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("#"))
         assert "gate_go" in code, f"{fn} can publish without a founder GO"
+
+
+def test_windows_signed_publish_is_go_gated_before_the_public_upload():
+    """The signed Windows path must call gate_go BEFORE win_upload — no public bytes without a GO."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ship.py")).read()
+    body = src.split("def cmd_ship_windows")[1].split("\ndef ")[0]
+    code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("#"))
+    assert "gate_go" in code and "win_upload" in code, "cmd_ship_windows must gate_go and upload"
+    assert code.index("gate_go") < code.index("win_upload"), \
+        "gate_go must run before win_upload — a public artifact must never precede the founder GO"
