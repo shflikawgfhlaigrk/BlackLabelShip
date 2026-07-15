@@ -17,5 +17,14 @@ r2_updates_key = "updates/academy/{build}.zip"
 manifest_endpoint = "/api/version/academy"
 dl_url = "https://blacklabelbots.com/dl/academy.zip?k=c76acb879e8fe0d8d69a9b081e01758d"
 ports = []
-test_cmd = "python3 -m pytest tests/ -q"
+# Two legs, both fail-closed. Python was pinned to system python3 (3.9.6) because the `python3` on
+# PATH is Homebrew 3.14, which has no pytest, so the bare command died with "No module named pytest"
+# and took the preflight gate down with it. A missing test RUNNER must never read as a failing test
+# suite — gate_test_runner now says so in its own words.
+#
+# The xctest leg exists because pytest here covers the CONTENT pipeline only: every Swift line in the
+# app — the reader, the updater, the whole trial/$30-mo entitlement machine in Sources/Trial.swift —
+# was shipping with no ship gate over it at all. tests/xctest.sh carries its own zero-test guard, so
+# an empty <Testables> reports FAIL instead of the "Executed 0 tests / TEST SUCCEEDED" green.
+test_cmd = ["/usr/bin/python3 -m pytest tests/ -q", "bash tests/xctest.sh"]
 entitlements_file = ""

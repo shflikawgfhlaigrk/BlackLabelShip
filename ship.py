@@ -169,7 +169,19 @@ def validate(cfg, path):
         ef = os.path.join(expand(cfg["repo"]), cfg["entitlements_file"])
         if not os.path.isfile(ef):
             fail(f"{path}: entitlements_file not found: {ef}")
+    if "test_cmd" in cfg:
+        for c in test_cmds(cfg):
+            if not isinstance(c, str) or not c.strip():
+                fail(f"{path}: test_cmd must be a command string or a list of command strings")
     return cfg
+
+
+def test_cmds(cfg):
+    """The preflight test legs, always as a list. A str config is one leg (back-compat)."""
+    tc = cfg.get("test_cmd")
+    if not tc:
+        return []
+    return list(tc) if isinstance(tc, list) else [tc]
 
 
 def validate_windows(cfg, path):
@@ -475,6 +487,27 @@ def _notary_auth():
 # the ESP32/CSI hardware (homefront does). We ban invented figures + present-tense capability overclaims.
 FORBIDDEN_CLAIMS = r"791,123|791123|789,123|82\.0%|648W|648 wins|16-module|16 modules|16 signals|8 timeframes|2-of-8"
 
+# A test leg that runs a script must PROVE the script is there. `bash tests/xctest.sh` on a missing
+# file exits 127 with "No such file or directory" — which arrives at the gate as an ordinary non-zero
+# return, indistinguishable from "the suite ran and failed". That confusion is what pinned academy's
+# python3 (a missing pytest MODULE read as a failing suite). Worse is the same mistake written
+# defensively — `[ -f tests/xctest.sh ] && bash tests/xctest.sh` returns 0 when the runner is gone,
+# which is a SILENT PASS: the gate reports green having executed nothing. So the runner's existence
+# is its own check with its own loud message, in the spirit of xctest.sh's own zero-test guard: an
+# absent runner is never a pass and never a mystery.
+SCRIPT_RUNNER_RE = re.compile(r"(?:^|\s)((?:[\w.@+-]+/)*[\w.@+-]+\.sh)(?=\s|$)")
+
+
+def gate_test_runner(cmd, repo, name):
+    """FAIL LOUDLY if a test leg names a script that does not exist."""
+    for rel in SCRIPT_RUNNER_RE.findall(cmd):
+        path = rel if os.path.isabs(rel) else os.path.join(repo, rel)
+        if not os.path.isfile(path):
+            fail(f"preflight: {name}: test runner {rel!r} DOES NOT EXIST at {path} — the leg "
+                 f"{cmd!r} would run nothing. A missing runner is not a passing suite and not a "
+                 f"failing one: it is a gate that never fired. Restore the runner or remove the "
+                 f"leg from the config deliberately.")
+
 
 def stage_preflight(cfg, name):
     hold = os.path.join(APPS_DIR, f"{name}.HOLD")
@@ -490,12 +523,15 @@ def stage_preflight(cfg, name):
         fail(f"preflight: {name}: working tree dirty ({len(dirty)} entries) — commit first (provenance)")
     head = _run(["git", "-C", repo, "rev-parse", "--short", "HEAD"]).stdout.strip()
     print(f"  preflight: tree clean at {head}")
-    if cfg.get("test_cmd"):
-        print(f"  preflight: tests: {cfg['test_cmd']}")
-        r2 = subprocess.run(cfg["test_cmd"], shell=True, cwd=repo)
-        if r2.returncode != 0:
-            fail(f"preflight: {name}: tests failed (rc={r2.returncode})")
-        print("  preflight: tests PASS")
+    cmds = test_cmds(cfg)
+    if cmds:
+        for i, cmd in enumerate(cmds, 1):
+            print(f"  preflight: tests [{i}/{len(cmds)}]: {cmd}")
+            gate_test_runner(cmd, repo, name)
+            r2 = subprocess.run(cmd, shell=True, cwd=repo)
+            if r2.returncode != 0:
+                fail(f"preflight: {name}: tests failed (rc={r2.returncode}): {cmd}")
+        print(f"  preflight: tests PASS ({len(cmds)} leg(s))")
     else:
         print("  preflight: !! NO test_cmd configured — tests SKIPPED (loud)")
     return head
@@ -644,9 +680,38 @@ def gate_build_number(name, build, sha=None):
 # (the expensive, interesting check) and only then stops at the owner's door — writing nothing.
 GO_SUFFIX = ".GO"
 
+# ---- the build binding: a GO authorizes a BUILD, not a directory ----
+# THE b29→b30→b31 ACADEMY DRIFT. `--publish-staged` ships whatever sits in work/<app>-stage RIGHT
+# NOW. That directory is mutable state: anyone can rebuild into it between the founder's word and
+# the publish, and every existing gate still goes green — gate_provenance only proves the bytes
+# carry THEIR OWN commit, and gate_build_number only proves the number was not already shipped with
+# different bytes. Neither one has any idea which build Michael actually authorized, so a GO written
+# for b29 silently publishes b31.
+#
+# The fix is to let the GO say so. If the founder's word names a build ("GO — ship b31"), the number
+# becomes part of the authorization and the staged bundle's CFBundleVersion must match it. A GO that
+# names no build is unchanged — still a valid, unbound authorization (that is the historical
+# behavior, and shrinking it would break every GO Michael has already written).
+GO_BUILD_RE = re.compile(r"\bb(?:uild )?(\d+)\b", re.IGNORECASE)
 
-def gate_go(name):
-    """FAIL CLOSED unless the founder has explicitly authorized publishing THIS app."""
+# Lanes whose artifact carries no build number at all (the Windows road: no CFBundleVersion, and no
+# build in its ledger row) pass this sentinel to say so OUT LOUD. It is deliberately not the default:
+# a caller that simply forgets to pass `build` gets the fail-closed path, because a Mac road quietly
+# losing its binding is precisely the regression this gate exists to prevent.
+NO_BUILD = "<lane-has-no-build-number>"
+
+
+def go_build_tokens(word):
+    """The distinct build numbers named in a GO's text. [] means the GO is not build-bound."""
+    return sorted({int(n) for n in GO_BUILD_RE.findall(word)})
+
+
+def gate_go(name, build=None):
+    """FAIL CLOSED unless the founder has explicitly authorized publishing THIS app.
+
+    `build` is the staged bundle's CFBundleVersion. When the GO names a build, it MUST match.
+    Pass NO_BUILD from a lane whose artifact has no build number.
+    """
     go = os.path.join(APPS_DIR, name + GO_SUFFIX)
     if not os.path.isfile(go):
         fail(f"NO GO: publishing {name} is an owner-only act (CHARTER §3) and there is no "
@@ -658,8 +723,37 @@ def gate_go(name):
     if not word:
         fail(f"NO GO: {os.path.basename(go)} is empty — an empty file is not an authorization. "
              f"It must carry the founder's word.")
-    print(f"  gate_go: founder GO on file for {name} ({word.splitlines()[0][:60]})")
-    return word.splitlines()[0][:120]
+    first = word.splitlines()[0][:120]
+    wanted = go_build_tokens(word)
+    if not wanted:
+        print(f"  gate_go: founder GO on file for {name} ({first[:60]}) — names no build, unbound")
+        return first
+    if len(wanted) > 1:
+        fail(f"NO GO: {os.path.basename(go)} names more than one build {wanted} — an ambiguous "
+             f"authorization is not an authorization. Rewrite the GO naming exactly the build to "
+             f"publish. Refusing to guess which one he meant.")
+    want = wanted[0]
+    if build == NO_BUILD:
+        # Not a hole, and not silent: this lane builds its artifact fresh inside this very
+        # invocation, so there is no mutable stage dir for his word to drift away from — the drift
+        # this binding exists to catch cannot happen here. The number in his GO is prose we have
+        # nothing to check it against, so we say exactly that and let the GO stand on its own.
+        print(f"  gate_go: founder GO on file for {name} ({first[:60]}) — names build {want}, but "
+              f"this lane's artifact carries no build number: binding NOT verified (recorded as-is)")
+        return first
+    if build is None:
+        fail(f"NO GO: {os.path.basename(go)} authorizes build {want}, but this lane passed no build "
+             f"number, so the binding cannot be checked. An unverifiable binding is not a pass — and "
+             f"a publish road that lost its build binding is the b29→b31 drift waiting to happen "
+             f"again. Pass the staged CFBundleVersion, or NO_BUILD if the artifact truly has none.")
+    if str(build).strip() != str(want):
+        fail(f"NO GO: {os.path.basename(go)} authorizes build {want}, but the staged artifact is "
+             f"build {build}. The stage dir is mutable — this is exactly the academy b29→b31 drift: "
+             f"the founder's word and the bytes on the road are for DIFFERENT builds. Nothing here "
+             f"publishes. Either restage build {want} or get a GO for build {build}.")
+    print(f"  gate_go: founder GO on file for {name} ({first[:60]}) — bound to build {want}, "
+          f"staged artifact is build {build} ✓")
+    return first
 
 
 def stage_notarize(app_path, cfg, name):
@@ -814,7 +908,9 @@ def cmd_publish_staged(name, notary_id, dry_run):
 
     print("  gates:")
     head = gate_provenance(app, name)
-    go = gate_go(name)
+    # `build` is read from the staged bundle above — a GO that names a build is checked against the
+    # artifact actually on the road, not against whatever the dispatch believed was staged.
+    go = gate_go(name, build)
     if not run_local_gates(app, cfg):
         fail(f"{name}: local gates failed — nothing uploads")
 
@@ -872,7 +968,7 @@ def cmd_ship(name, dry_run):
     if not run_local_gates(app, cfg):
         fail(f"{name}: local gates failed — nothing uploads")
     head = gate_provenance(app, name, head)
-    go = gate_go(name)
+    go = gate_go(name, build)
     os.makedirs(WORK_DIR, exist_ok=True)
     zip_path = os.path.join(WORK_DIR, f"{name}.zip")
     sha = pack(app, zip_path, app_key=name)
@@ -1066,7 +1162,12 @@ def cmd_ship_windows(name, build_mode, run_ref):
     # the same owner-only, irreversible act the Mac roads gate — so it is gated the same way. The GO
     # is required BEFORE the public upload; absence is refusal, not permission (CHARTER §3). Without
     # this, cmd_ship_windows was a third road into the ship-of-record that no gate_go guarded.
-    go = gate_go(name)
+    #
+    # NO_BUILD, stated explicitly: a Windows artifact carries no CFBundleVersion and this lane's
+    # ledger row has no build number, so a build-bound GO cannot be checked here. The lane says so
+    # out loud rather than defaulting into the check and refusing every GO that happens to mention
+    # a build ("GO — ship circuit windows b5" is normal wording, and must not brick the road).
+    go = gate_go(name, NO_BUILD)
     signed = win_sign_scan_gauntlet(cfg, name, artifact, build_mode)
     sha = sha256_file(signed)
     win_upload(cfg, name, signed, sha)

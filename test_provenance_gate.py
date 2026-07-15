@@ -111,7 +111,7 @@ def test_empty_go_is_not_an_authorization(tmp_path, monkeypatch):
 
 def test_go_on_file_authorizes_and_is_recorded(tmp_path, monkeypatch):
     _go_file(tmp_path, monkeypatch, "sovereign", "GO — ship b39. Michael, 2026-07-12\nsecond line")
-    assert ship.gate_go("sovereign").startswith("GO — ship b39")
+    assert ship.gate_go("sovereign", build="39").startswith("GO — ship b39")
 
 
 def test_go_for_one_app_does_not_authorize_another(tmp_path, monkeypatch):
@@ -119,6 +119,152 @@ def test_go_for_one_app_does_not_authorize_another(tmp_path, monkeypatch):
     _go_file(tmp_path, monkeypatch, "academy", "GO — ship b29. Michael")
     with pytest.raises(SystemExit) as e:
         ship.gate_go("sovereign")
+    assert e.value.code != 0
+
+
+# ---------- the build binding: a GO authorizes a BUILD, not a directory ----------
+# The academy b29→b30→b31 drift: work/<app>-stage is mutable state, and no gate compared what was
+# staged against what the founder actually authorized. gate_provenance proves the bytes carry their
+# OWN commit; gate_build_number proves the number was not already shipped. Both go green on a build
+# nobody approved. Only the GO knows which build Michael meant — so now it can say.
+
+def test_a_go_bound_to_one_build_refuses_a_different_staged_build(tmp_path, monkeypatch):
+    """The drift, mechanised: his word says b29, the stage dir holds b31. Nothing publishes."""
+    _go_file(tmp_path, monkeypatch, "academy", "GO — ship b29. Michael, 2026-07-13")
+    with pytest.raises(SystemExit) as e:
+        ship.gate_go("academy", build="31")
+    assert e.value.code != 0
+
+
+def test_a_go_bound_to_a_build_passes_the_build_it_names(tmp_path, monkeypatch):
+    _go_file(tmp_path, monkeypatch, "academy", "GO — ship b31. Michael, 2026-07-14")
+    assert ship.gate_go("academy", build="31").startswith("GO — ship b31")
+
+
+def test_a_go_naming_no_build_is_unbound_and_still_authorizes(tmp_path, monkeypatch):
+    """Every GO Michael has already written names no build. Those must keep working."""
+    _go_file(tmp_path, monkeypatch, "academy", "GO — ship it. Michael")
+    assert ship.gate_go("academy", build="31") == "GO — ship it. Michael"
+
+
+def test_a_go_naming_two_builds_is_ambiguous_and_refused(tmp_path, monkeypatch):
+    """"b30 or b31" is not an authorization — the gate must not pick one."""
+    _go_file(tmp_path, monkeypatch, "academy", "GO — ship b30, and b31 once it lands. Michael")
+    with pytest.raises(SystemExit) as e:
+        ship.gate_go("academy", build="31")
+    assert e.value.code != 0
+
+
+def test_a_publish_road_that_loses_its_build_binding_is_refused(tmp_path, monkeypatch):
+    """A road that forgets to pass the staged build must NOT sail past a build-bound GO."""
+    _go_file(tmp_path, monkeypatch, "academy", "GO — ship b31. Michael")
+    with pytest.raises(SystemExit) as e:
+        ship.gate_go("academy", build=None)
+    assert e.value.code != 0
+
+
+def test_a_buildless_lane_must_say_so_explicitly(tmp_path, monkeypatch):
+    """Windows has no CFBundleVersion: "ship circuit windows b5" must not brick the road...
+
+    ...but only for a lane that declares NO_BUILD. The sentinel is the whole point — it keeps the
+    escape hatch out of the default path, where a Mac road could inherit it by accident.
+    """
+    _go_file(tmp_path, monkeypatch, "circuit-windows", "GO — ship circuit windows b5. Michael")
+    assert ship.gate_go("circuit-windows", ship.NO_BUILD).startswith("GO — ship circuit windows b5")
+
+
+def test_no_mac_publish_road_declares_itself_buildless():
+    """NO_BUILD belongs to the Windows lane alone; on a Mac road it would disarm the binding."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ship.py")).read()
+    for fn in ("cmd_ship", "cmd_publish_staged"):
+        body = src.split(f"def {fn}")[1].split("\ndef ")[0]
+        code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("#"))
+        assert "NO_BUILD" not in code, f"{fn} claims to have no build number — it reads one from the bundle"
+
+
+def test_build_tokens_read_his_words_not_every_number():
+    """`b31` and `build 31` bind; prose numbers and sha-like strings must not."""
+    assert ship.go_build_tokens("GO — ship b31. Michael") == [31]
+    assert ship.go_build_tokens("GO — ship build 31") == [31]
+    assert ship.go_build_tokens("GO — ship B31") == [31]
+    assert ship.go_build_tokens("GO — ship it, fixes 3 bugs") == []
+    assert ship.go_build_tokens("GO — ship commit b31abc4") == []
+    assert ship.go_build_tokens("GO — ship b30 or b31") == [30, 31]
+
+
+def test_both_mac_publish_paths_bind_the_go_to_the_staged_build():
+    """A binding checked against the wrong number is no binding: pass the STAGED build, not a guess."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ship.py")).read()
+    for fn in ("cmd_ship", "cmd_publish_staged"):
+        body = src.split(f"def {fn}")[1].split("\ndef ")[0]
+        code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("#"))
+        assert "gate_go(name, build)" in code, \
+            f"{fn} calls gate_go without the staged build — a build-bound GO cannot be checked"
+
+
+# ---------- preflight: every configured test leg is a gate ----------
+# Academy's preflight ran pytest ONLY, so the entire Swift side — reader, updater, and the whole
+# trial/$30-mo entitlement machine — had no ship gate over it. test_cmd is now a list of legs, each
+# fail-closed, and a leg whose runner is missing says so in its own words instead of arriving as an
+# anonymous non-zero exit.
+
+def test_academy_preflight_runs_the_xctest_leg_not_pytest_alone():
+    cfg = ship.load_config(os.path.join(ship.APPS_DIR, "academy.toml"))
+    legs = ship.test_cmds(cfg)
+    assert any("pytest" in c for c in legs), "academy lost its pytest leg"
+    assert any("xctest.sh" in c for c in legs), \
+        "academy preflight runs pytest only — the Swift side ships ungated"
+
+
+def test_a_string_test_cmd_is_still_one_leg():
+    """Nine other configs still use the string form; they must be untouched."""
+    assert ship.test_cmds({"test_cmd": "pytest -q"}) == ["pytest -q"]
+    assert ship.test_cmds({}) == []
+
+
+def test_a_missing_test_runner_fails_loudly(tmp_path):
+    """The silent-pass hazard: a leg that runs nothing must never read as green."""
+    with pytest.raises(SystemExit) as e:
+        ship.gate_test_runner("bash tests/xctest.sh", str(tmp_path), "academy")
+    assert e.value.code != 0
+
+
+def test_a_present_test_runner_passes(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "xctest.sh").write_text("#!/bin/bash\nexit 0\n")
+    ship.gate_test_runner("bash tests/xctest.sh", str(tmp_path), "academy")   # no raise
+
+
+def _preflight_repo(tmp_path, monkeypatch, legs):
+    monkeypatch.setattr(ship, "APPS_DIR", str(tmp_path / "apps"))
+    (tmp_path / "apps").mkdir(exist_ok=True)
+    return {"repo": str(tmp_path), "test_cmd": legs}
+
+
+def test_every_configured_leg_actually_runs(tmp_path, monkeypatch):
+    cfg = _preflight_repo(tmp_path, monkeypatch, ["touch leg1", "touch leg2"])
+    ship.stage_preflight(cfg, "academy")
+    assert (tmp_path / "leg1").exists() and (tmp_path / "leg2").exists(), \
+        "a configured test leg was skipped — the pytest-only hole"
+
+
+def test_a_failing_second_leg_stops_the_road(tmp_path, monkeypatch):
+    """pytest green + xctest red must NOT reach the build. Fail-closed on every leg."""
+    cfg = _preflight_repo(tmp_path, monkeypatch, ["touch leg1", "exit 1"])
+    with pytest.raises(SystemExit) as e:
+        ship.stage_preflight(cfg, "academy")
+    assert e.value.code != 0
+    assert (tmp_path / "leg1").exists(), "the first leg never ran — wrong failure"
+
+
+def test_a_failing_xctest_leg_stops_the_road(tmp_path, monkeypatch):
+    """The zero-test guard firing inside xctest.sh must take the whole preflight down."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "xctest.sh").write_text(
+        "#!/bin/bash\necho 'FAIL: xcodebuild executed ZERO tests'\nexit 1\n")
+    cfg = _preflight_repo(tmp_path, monkeypatch, ["true", "bash tests/xctest.sh"])
+    with pytest.raises(SystemExit) as e:
+        ship.stage_preflight(cfg, "academy")
     assert e.value.code != 0
 
 
