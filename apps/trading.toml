@@ -6,8 +6,13 @@ app_name = "Black Label Trading.app"
 build_cmd = "./build-developer-id.sh"
 built_app_path = "build/Black Label Trading.app"
 arch = "universal2"
-required_entitlements = ["com.apple.security.cs.disable-library-validation", "com.apple.security.network.client", "com.apple.security.cs.allow-dyld-environment-variables"]
-forbidden_entitlements = ["com.apple.security.app-sandbox"]
+# allow-dyld-environment-variables is FORBIDDEN, not required: it governs DYLD_* only, and the
+# backend launcher passes PYTHONPATH (never stripped by the hardened runtime) and sets no DYLD_*
+# variable. Granted alongside disable-library-validation on this non-sandboxed Developer-ID app it
+# would re-enable DYLD_INSERT_LIBRARIES injection of unsigned dylibs. Sources/app-developerid.entitlements
+# withholds it; listing it as required made gate_entitlements demand the vulnerability back.
+required_entitlements = ["com.apple.security.cs.disable-library-validation", "com.apple.security.network.client"]
+forbidden_entitlements = ["com.apple.security.app-sandbox", "com.apple.security.cs.allow-dyld-environment-variables"]
 ships_no_data_globs = ["*.sqlite", "*.sqlite3", "*.db", "*.csv", "*.pem", "*.key", "*.tokens", "*secrets*", "bars*", "ledger*", "*.env"]
 r2_dl_key = "trading.zip"
 r2_updates_key = "updates/trading/{build}.zip"
