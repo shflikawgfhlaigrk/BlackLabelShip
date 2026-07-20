@@ -41,7 +41,7 @@ APPS = {
         "first_run": """FIRST RUN
 1. Open the app. The data backend starts itself - nothing to launch separately.
 2. Connect YOUR OWN platform login when prompted (WealthCharts, TopStep,
-   Tradovate, MetaTrader 5, TradingView, or cTrader). The app starts EMPTY
+   Tradovate, or TradingView). The app starts EMPTY
    until your feed connects - it ships with no market data and no history.
 3. Signals appear once your live feed is flowing.
 
