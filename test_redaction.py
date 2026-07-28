@@ -80,6 +80,62 @@ class RedactionTest(unittest.TestCase):
         self.assertIn("FAIL:", printed)
         self.assertIn("notarize failed:", printed)  # message still actionable
 
+    # ---- end-to-end: the real _notary_auth() road, not just redact() in isolation ----
+    def test_notary_auth_credentials_never_reach_the_fail_sink(self):
+        """Drive synthetic credentials through the real inline-API-key path.
+
+        This is the property the CodeQL py/clear-text-logging alert on the fail()
+        sink turns on, so it is locked end-to-end rather than pattern-by-pattern:
+        _notary_auth() -> notarytool argv -> fail(). The first assertion is the
+        positive control — if the sentinel ever stops reaching argv the rest of
+        this test would pass vacuously.
+        """
+        import json
+        import tempfile
+
+        sentinel = "SENTINEL_LEAK_CANARY_12345"
+        tmp = tempfile.mkdtemp(prefix="ship-redaction-test-")
+        key_path = os.path.join(tmp, "AuthKey_%s.p8" % sentinel)
+        with open(key_path, "w") as f:
+            f.write("-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n")
+        notary_json = os.path.join(tmp, "notary.json")
+        with open(notary_json, "w") as f:
+            json.dump({"key_path": key_path, "key_id": sentinel,
+                       "issuer": sentinel + "-6de70-1111-2222"}, f)
+
+        with mock.patch.object(ship, "NOTARY_SECRETS", notary_json), \
+             mock.patch.object(ship, "_run", return_value=mock.Mock(returncode=1)):
+            auth, label = ship._notary_auth()   # returncode=1 => keychain miss => inline fallback
+
+        self.assertEqual(label, "inline-apikey")
+        argv = ["xcrun", "notarytool", "submit", "app.zip"] + list(auth) + ["--no-wait"]
+        argv_str = " ".join(argv)
+        # POSITIVE CONTROL: the credential really does ride in the argv.
+        self.assertIn(sentinel, argv_str, "sentinel must reach argv or this test is vacuous")
+
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), self.assertRaises(SystemExit):
+            ship.fail("notarize: submit failed: " + argv_str)
+        printed = buf.getvalue()
+        self.assertNotIn(sentinel, printed, "credential survived the fail() sink: %s" % printed)
+        self.assertIn("notarize: submit failed:", printed)  # message stays actionable
+
+    def test_subprocess_argv_dump_is_masked(self):
+        """TimeoutExpired / CalledProcessError render the FULL argv — the exact
+        vector this redaction exists for."""
+        import subprocess
+
+        ship.register_secret("SENTINELKEYID9XY8")
+        argv = ["xcrun", "notarytool", "submit", "app.zip",
+                "--key-id", "SENTINELKEYID9XY8", "--issuer", "abc-123"]
+        for exc in (subprocess.TimeoutExpired(argv, 30),
+                    subprocess.CalledProcessError(1, argv, output="boom")):
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf), self.assertRaises(SystemExit):
+                ship.fail("notarize: %s" % exc)
+            self.assertNotIn("SENTINELKEYID9XY8", buf.getvalue(),
+                             "%s leaked argv" % type(exc).__name__)
+
     def test_notary_secrets_absolute_path_not_in_no_auth_message(self):
         # The no-auth message must name the file without publishing $HOME.
         self.assertEqual(ship.NOTARY_SECRETS_DISPLAY, "~/.utah/secrets/notary.json")
