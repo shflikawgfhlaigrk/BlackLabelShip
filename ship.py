@@ -59,8 +59,70 @@ def is_windows_cfg(cfg):
     return isinstance(cfg, dict) and cfg.get("platform") == "windows"
 
 
+# ---------- secret redaction (sink-side) --------------------------------------
+# Everything bl-ship prints lands in an operator terminal AND in CI logs, so the
+# scrub happens at the sink, not at each call site — a call site added later is
+# then safe by default. Two layers:
+#   1. values registered at runtime (the credentials this run actually loaded)
+#   2. patterns, for credentials echoed back by a tool we shell out to. This is
+#      the layer that matters: notarytool prints its own argv on some errors and
+#      a subprocess exception (TimeoutExpired/CalledProcessError) renders the
+#      FULL argv — which carries --key/--key-id/--issuer, and signtool's /p.
+_SECRETS = set()
+
+# Sentinels and other non-secret constants that must never be registered.
+_NEVER_SECRET = {UNSIGNED, "true", "false", "none", "null"}
+
+
+def register_secret(value):
+    """Remember a live credential so it can never reach a log verbatim."""
+    v = str(value or "").strip()
+    if len(v) >= 8 and v.lower() not in {s.lower() for s in _NEVER_SECRET}:
+        _SECRETS.add(v)
+    return value
+
+
+# Longest option names first — alternation is leftmost-first, so `key-id` must be
+# tried before `key` or `--key-id X` would only half-match.
+_SECRET_ARG_RE = re.compile(
+    r'(--(?:password|api-key|apiKey|key-id|issuer|token|secret|key)[=\s]+)'
+    r'("[^"]*"|\'[^\']*\'|\S+)',
+    re.IGNORECASE,
+)
+# signtool's PFX password switch, e.g. `signtool sign /p hunter2 app.exe`.
+_SIGNTOOL_PW_RE = re.compile(r'((?:^|\s)/p[=\s]+)(\S+)')
+# Apple app-specific password (xxxx-xxxx-xxxx-xxxx).
+_APPLE_APP_PW_RE = re.compile(r'\b[a-z]{4}-[a-z]{4}-[a-z]{4}-[a-z]{4}\b')
+# Bearer / Authorization headers.
+_BEARER_RE = re.compile(r'((?:authorization:\s*)?\bbearer\s+)\S+', re.IGNORECASE)
+# ?k=<gate key> on a /dl URL.
+_URL_KEY_RE = re.compile(r'([?&](?:k|key|token|sig)=)[^\s&"\']+', re.IGNORECASE)
+
+REDACTED = "[REDACTED]"
+
+
+def redact(text):
+    """Mask credential material in anything headed for stdout."""
+    s = str(text)
+    # Registered values first, longest first so overlapping values fully mask.
+    for v in sorted(_SECRETS, key=len, reverse=True):
+        if v in s:
+            s = s.replace(v, REDACTED)
+    s = _SECRET_ARG_RE.sub(lambda m: m.group(1) + REDACTED, s)
+    s = _SIGNTOOL_PW_RE.sub(lambda m: m.group(1) + REDACTED, s)
+    s = _APPLE_APP_PW_RE.sub(REDACTED, s)
+    s = _BEARER_RE.sub(lambda m: m.group(1) + REDACTED, s)
+    s = _URL_KEY_RE.sub(lambda m: m.group(1) + REDACTED, s)
+    # Collapse the absolute home path; keeps messages actionable without
+    # publishing the operator's filesystem layout into a CI log.
+    home = os.path.expanduser("~")
+    if home and home not in ("/", "") and home in s:
+        s = s.replace(home, "~")
+    return s
+
+
 def fail(msg):
-    print(f"FAIL: {msg}")
+    print(f"FAIL: {redact(msg)}")
     sys.exit(1)
 
 
@@ -391,7 +453,10 @@ R2_BUCKET = "sovereign-files"  # DOWNLOADS binding in worker/wrangler.worker.tom
 SITE_URL = "https://blacklabelbots.com"
 TEAM_ID = "745ZPGFRA5"
 NOTARY_PROFILE = os.environ.get("NOTARY_PROFILE", "BL_NOTARY")
-NOTARY_SECRETS = os.path.expanduser("~/.utah/secrets/notary.json")
+# The tilde form is what operator-facing messages quote; the expanded absolute
+# path is only ever opened, never printed.
+NOTARY_SECRETS_DISPLAY = "~/.utah/secrets/notary.json"
+NOTARY_SECRETS = os.path.expanduser(NOTARY_SECRETS_DISPLAY)
 
 
 def _notary_auth():
@@ -413,12 +478,17 @@ def _notary_auth():
             d = json.load(f)
         key = os.path.expanduser(d["key_path"])
         if os.path.exists(key) and d.get("key_id") and d.get("issuer"):
+            # These ride in notarytool's argv; register them so they cannot
+            # survive in a tool error, a traceback, or an argv dump.
+            register_secret(d["key_id"])
+            register_secret(d["issuer"])
+            register_secret(key)
             return (["--key", key, "--key-id", d["key_id"], "--issuer", d["issuer"]],
                     "inline-apikey")
     except (OSError, ValueError, KeyError):
         pass
     fail(f"notarize: no auth — keychain profile {NOTARY_PROFILE} missing AND "
-         f"{NOTARY_SECRETS} unusable. Re-run `xcrun notarytool store-credentials "
+         f"{NOTARY_SECRETS_DISPLAY} unusable. Re-run `xcrun notarytool store-credentials "
          f"{NOTARY_PROFILE}` or fix notary.json.")
 # Fabrications only. NOT "through-wall" — that's an HONEST feature name when the page gates it behind
 # the ESP32/CSI hardware (homefront does). We ban invented figures + present-tense capability overclaims.
@@ -440,7 +510,7 @@ def stage_preflight(cfg, name):
     head = _run(["git", "-C", repo, "rev-parse", "--short", "HEAD"]).stdout.strip()
     print(f"  preflight: tree clean at {head}")
     if cfg.get("test_cmd"):
-        print(f"  preflight: tests: {cfg['test_cmd']}")
+        print(f"  preflight: tests: {redact(cfg['test_cmd'])}")
         r2 = subprocess.run(cfg["test_cmd"], shell=True, cwd=repo)
         if r2.returncode != 0:
             fail(f"preflight: {name}: tests failed (rc={r2.returncode})")
@@ -452,7 +522,7 @@ def stage_preflight(cfg, name):
 
 def stage_build(cfg, name):
     repo = expand(cfg["repo"])
-    print(f"  build: {cfg['build_cmd']} (in {repo})")
+    print(f"  build: {redact(cfg['build_cmd'])} (in {repo})")
     r = subprocess.run(cfg["build_cmd"], shell=True, cwd=repo)
     if r.returncode != 0:
         fail(f"build: {name}: build_cmd failed (rc={r.returncode})")
@@ -495,7 +565,7 @@ def stage_notarize(app_path, cfg, name):
             except (ValueError, KeyError):
                 pass
         detail = (r.stderr or r.stdout).strip()[:200]
-        print(f"  notarize: submit attempt {attempt} failed ({detail or 'empty output'}); retrying…")
+        print(f"  notarize: submit attempt {attempt} failed ({redact(detail) or 'empty output'}); retrying…")
         _t.sleep(15)
     if not sid:
         fail("notarize: submit failed after 3 attempts")
@@ -507,7 +577,7 @@ def stage_notarize(app_path, cfg, name):
         ri = _run(["xcrun", "notarytool", "info", sid, *auth,
                    "--output-format", "json"])
         if ri.returncode != 0:
-            print(f"  notarize: poll error (transient): {(ri.stderr or ri.stdout).strip()[:120]}")
+            print(f"  notarize: poll error (transient): {redact((ri.stderr or ri.stdout).strip()[:120])}")
             continue
         status = json.loads(ri.stdout).get("status", "?")
         print(f"  notarize: {status}")
@@ -522,7 +592,7 @@ def stage_notarize(app_path, cfg, name):
         if r.returncode == 0:
             break
         detail = (r.stdout or r.stderr).strip()[:200]
-        print(f"  notarize: staple attempt {attempt} failed ({detail}); retrying…")
+        print(f"  notarize: staple attempt {attempt} failed ({redact(detail)}); retrying…")
         _t.sleep(30)
     if r is None or r.returncode != 0:
         fail(f"notarize: staple failed: {(r.stdout or r.stderr).strip()[:200]}")
@@ -692,7 +762,7 @@ def win_build(cfg, name, build_mode, run_ref):
             fail(f"win-build: no successful '{wf}' run to pull (ci-pull needs a green CI build)")
         cmd = cmd.replace("download  ", f"download {rid} ")
         run_ref = rid
-    print(f"  win-build: ci-pull run={run_ref}: {cmd}")
+    print(f"  win-build: ci-pull run={run_ref}: {redact(cmd)}")
     r = subprocess.run(cmd, shell=True, cwd=SHIP_ROOT)
     if r.returncode != 0:
         fail(f"win-build: {name}: artifact pull failed (rc={r.returncode})")
@@ -739,13 +809,13 @@ def win_sign_scan_gauntlet(cfg, name, artifact, build_mode):
     if not sign_tmpl:
         fail(f"win-sign: {name}: signing_identity set but no sign_cmd configured")
     cmd = sign_tmpl.replace("{thumbprint}", thumb).replace("{artifact}", artifact)
-    print(f"  win-sign: {cmd}")
+    print(f"  win-sign: {redact(cmd)}")
     r = subprocess.run(cmd, shell=True, cwd=SHIP_ROOT)
     if r.returncode != 0:
         fail(f"win-sign: {name}: signtool failed (rc={r.returncode})")
     if build_mode == "rig":
         scan = cfg.get("defender_scan_cmd", "").replace("{artifact}", artifact)
-        print(f"  win-defender: {scan}")
+        print(f"  win-defender: {redact(scan)}")
         r = subprocess.run(scan, shell=True)
         if r.returncode != 0:
             fail(f"win-defender: {name}: Defender scan flagged the artifact (rc={r.returncode})")
