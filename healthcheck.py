@@ -3,9 +3,9 @@
 any failure (Pushover via utah.alerts, mirrored to email on critical). Idempotent, logged,
 never raises. Registered as launchd com.blacklabel.healthcheck.
 
-Checks: public sites return 200, Stripe reachable (read-only key fetch), the Utah daemon
-deck is alive, and the off-machine backup ran within the last 26h. Run with --force-fail to
-inject a synthetic failure and PROVE the alert path end to end.
+Checks: the Cloudflare public monitor is fresh and green, Stripe is reachable (read-only
+key fetch), the Utah daemon deck is alive, and the off-machine backup ran within the last
+26h. Run with --force-fail to inject a synthetic failure and PROVE the alert path end to end.
 
 2026-07-06 deep-audit extension: every 30-min tick also regenerates the shared automation
 status (ProjectUtah/ops/automation_doctor.py report --write) and checks the things whose
@@ -23,13 +23,18 @@ import datetime as dt
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 
 sys.path.insert(0, str(pathlib.Path.home() / "ProjectUtah"))
 
-SITES = ["https://sunsetmixing.com/", "https://blacklabelbots.com/", "https://blvigil.com/"]
+CLOUD_OPS_URL = os.environ.get(
+    "BLACKLABEL_CLOUD_OPS_URL",
+    "https://blacklabel-cloud-ops.michael-070.workers.dev/health",
+)
 LOG = pathlib.Path.home() / ".utah" / "logs" / "healthcheck.log"
 BACKUP_LOG = pathlib.Path.home() / ".utah" / "logs" / "backup-offsite.log"
 DOCTOR = pathlib.Path.home() / "ProjectUtah" / "ops" / "automation_doctor.py"
@@ -44,13 +49,26 @@ def _log(msg: str) -> None:
         fh.write(line + "\n")
 
 
-def _http_ok(url: str, timeout: int = 20) -> bool:
+def _cloud_ops_status(timeout: int = 20) -> dict | None:
+    """Read Cloudflare's aggregate public monitor.
+
+    A 503 still carries the truthful JSON failure state, so parse its body instead
+    of discarding it. Missing, malformed, or unreachable state remains unknown and
+    therefore red to callers.
+    """
+    req = urllib.request.Request(CLOUD_OPS_URL, headers={"User-Agent": "blb-healthcheck"})
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "blb-healthcheck"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return 200 <= r.status < 400
+            body = r.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read() if exc.fp else b""
     except Exception:
-        return False
+        return None
+    try:
+        status = json.loads(body.decode("utf-8"))
+        return status if isinstance(status, dict) else None
+    except Exception:
+        return None
 
 
 def _stripe_ok() -> bool:
@@ -80,20 +98,44 @@ def _daemon_ok() -> bool:
 
 
 def _backup_fresh(max_age_h: int = 26) -> bool:
+    """TWO off-machine lanes append to BACKUP_LOG: the daily encrypted state
+    bundle (marker 'backup complete') and the restore-proven snapshot set
+    (terminal marker 'OFF-SITE COMPLETE' or 'FINISHED WITH ERRORS'). Judge each
+    lane by its own LAST marker line's embedded [timestamp].
+
+    2026-08-02 fix: the old check grepped the final 2000 bytes for 'backup
+    complete' — but the snapshot lane appends AFTER the daily marker, so even a
+    fully healthy day scrolled the marker out of the window (permanent false
+    FAIL), while drill runs' FATAL lines tripped the any-FATAL-after-marker
+    clause. Content timestamps, never window position or file mtime."""
     try:
         if not BACKUP_LOG.exists():
             return False
-        age_h = (dt.datetime.now().timestamp() - BACKUP_LOG.stat().st_mtime) / 3600
-        if age_h > max_age_h:
+        text = BACKUP_LOG.read_text()[-500_000:]  # bounded; ~2 days of runs
+        now = dt.datetime.now(dt.timezone.utc).timestamp()
+        drills = ("0000-TEST", "TESTSTAMP", "snaptest")
+
+        def last_epoch(needle: str, exclude: tuple = ()) -> float | None:
+            for line in reversed(text.splitlines()):
+                if needle in line and not any(x in line for x in exclude):
+                    m = re.match(r"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z\]", line)
+                    return (dt.datetime.fromisoformat(m.group(1) + "+00:00").timestamp()
+                            if m else None)
+            return None
+
+        # 1. daily state bundle went off-machine within budget
+        ok_ts = last_epoch("backup complete")
+        if ok_ts is None or (now - ok_ts) / 3600 > max_age_h:
             return False
-        # A stale success string must not mask a newer failure: the LAST
-        # 'backup complete' has to be the final word — any FATAL / command-not-found
-        # after it means the most recent run failed.
-        tail = BACKUP_LOG.read_text()[-2000:]
-        last_ok = tail.rfind("backup complete")
-        if last_ok == -1:
+        # 2. restore-proven snapshot lane: its last REAL terminal line must be a
+        #    fresh success (an incomplete part-set is not a backup).
+        done_ts = last_epoch("OFF-SITE COMPLETE", exclude=drills)
+        err_ts = last_epoch("FINISHED WITH ERRORS", exclude=drills)
+        if done_ts is None:
             return False
-        return not any(m in tail[last_ok:] for m in ("FATAL", "command not found"))
+        if err_ts is not None and err_ts > done_ts:
+            return False
+        return (now - done_ts) / 3600 <= max_age_h + 2  # snapshot lane finishes later
     except Exception:
         return False
 
@@ -158,20 +200,6 @@ def _automation_checks(checks: dict[str, bool]) -> None:
     checks["conductor not multiple"] = (status.get("conductor") or {}).get("status") != "MULTIPLE"
 
 
-def _realestate_smoke_ok(max_age_d: float = 8.0) -> bool:
-    """Latest RealEstate onboarding smoke (ops/realestate_onboarding_smoke.py, weekly
-    launchd) must exist, be fresh, and have passed. A smoke that never runs or went
-    stale is NOT green — the buyer path is unverified, which is a failure state."""
-    path = pathlib.Path.home() / ".utah" / "run" / "realestate_onboarding_smoke.json"
-    try:
-        age_d = (dt.datetime.now(dt.timezone.utc).timestamp() - path.stat().st_mtime) / 86400
-        if age_d > max_age_d:
-            return False
-        return bool(json.loads(path.read_text()).get("ok"))
-    except Exception:
-        return False
-
-
 def _truth_fresh(max_age_h: float = 2.0) -> bool:
     """STATE/truth.json regeneration lost its scheduler when com.blacklabel.watchdog
     was deliberately disabled (manifest: fleet re-bootstrap amplifier, 07-07).
@@ -226,13 +254,18 @@ def _discord_feeds_ok(hooks_path: pathlib.Path | None = None,
 
 def run(force_fail: bool = False) -> dict:
     checks: dict[str, bool] = {}
-    for u in SITES:
-        checks[f"site {u}"] = _http_ok(u)
+    cloud_ops = _cloud_ops_status()
+    cloud_health = (cloud_ops or {}).get("health") or {}
+    checks["cloud ops monitor fresh"] = bool(cloud_health.get("monitorFresh"))
+    checks["public sites and cloud APIs"] = bool(cloud_ops and cloud_ops.get("ok"))
     checks["stripe API"] = _stripe_ok()
     checks["daemon :8766"] = _daemon_ok()
     checks["backup <26h"] = _backup_fresh()
     checks["truth.json <2h"] = _truth_fresh()
-    checks["realestate onboarding smoke"] = _realestate_smoke_ok()
+    checks["realestate onboarding smoke"] = bool(
+        cloud_health.get("realestateSmokeFresh")
+        and ((cloud_ops or {}).get("realestateSmoke") or {}).get("ok")
+    )
     checks["discord feed routing"] = _discord_feeds_ok()
     _automation_checks(checks)
     if force_fail:

@@ -30,9 +30,18 @@ mkdir -p "$HOME/.utah/logs"
 
 log() { echo "[$(date -u +%FT%TZ)] snapshot: $*" | tee -a "$LOG"; }
 
-put() { # key localfile contenttype
-  ( cd "$DEPLOY" && npx --yes wrangler r2 object put "$BUCKET/$1" \
-      --file "$2" --remote --content-type "$3" >>"$LOG" 2>&1 )
+put() { # key localfile contenttype — retries transient API failures.
+  # 2026-08-01 run lost 3 parts to one-off 401 (CF API auth blip) and 502
+  # (gateway) responses over a ~90-min upload; a single failed part marks the
+  # whole restore-proven set FINISHED WITH ERRORS. Each attempt is independent,
+  # so retry with backoff instead of failing the set on one transient.
+  local try
+  for try in 1 2 3; do
+    ( cd "$DEPLOY" && npx --yes wrangler r2 object put "$BUCKET/$1" \
+        --file "$2" --remote --content-type "$3" >>"$LOG" 2>&1 ) && return 0
+    [[ $try -lt 3 ]] && { log "RETRY $try/2 in $((try*20))s: $1"; sleep $((try*20)); }
+  done
+  return 1
 }
 
 # --- chain on dump COMPLETION, never the clock (fix 2026-08-01) ---------------
