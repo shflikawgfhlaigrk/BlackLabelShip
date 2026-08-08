@@ -43,7 +43,7 @@ REQUIRED_KEYS = [
     "required_entitlements", "forbidden_entitlements", "ships_no_data_globs",
     "r2_dl_key", "r2_updates_key", "manifest_endpoint", "dl_url",
 ]
-OPTIONAL_KEYS = ["ports", "test_cmd", "sign_identity", "entitlements_file"]
+OPTIONAL_KEYS = ["ports", "test_cmd", "sign_identity", "entitlements_file", "min_supported_build"]
 VALID_ARCH = ("universal2", "arm64")
 
 # ---- Windows lane (STAGED-ONLY road; see apps/circuit-windows.toml) ----------
@@ -58,9 +58,31 @@ WIN_OPTIONAL_KEYS = [
     "build_mode_default", "build_cmd_ci", "build_cmd_rig", "ci_workflow",
     "ci_artifact_name", "sign_cmd", "defender_scan_cmd",
     "clean_buyer_gauntlet_cmd", "ports",
+    # Plan §W0.2 canonical contract-key spellings, accepted as aliases so a
+    # config authored to the plan's literal names validates instead of tripping
+    # the unknown-keys guard. They are COMMAND strings only:
+    #   build_cmd_windows -> alias of build_cmd_ci  (the ci-pull build command)
+    #   sign_windows      -> alias of sign_cmd      (the signtool command)
+    # The fail-closed signing AUTHORITY stays SOLELY signing_identity==UNSIGNED
+    # (single source of truth — sign_windows is a command, never a signedness
+    # flag, so it can never fail the road open).
+    "build_cmd_windows", "sign_windows",
+    # STORE-FIRST (MSIX) distribution — founder ruling 2026-07-20
+    # (STATE/decisions/windows-lane-go-20260720.md). `distribution` selects the
+    # tail: "store" (default) packages an MSIX and STAGES a Partner Center
+    # submission (Microsoft signs the MSIX free at ingestion — no Authenticode
+    # cert); "selfdist" is the DORMANT Authenticode /dl road above. The store
+    # keys are COMMAND/informational strings; the fail-closed store AUTHORITY is
+    # SOLELY the Partner Center marker (partner_center_ready()), never a config
+    # flag, so a config can never open the store road on its own say-so.
+    "distribution", "msix_package_cmd", "msix_manifest", "store_submission_cmd",
+    "store_pdp_url",
 ]
 # The sentinel that means "no cert yet" — the hard STAGED-ONLY trigger.
 UNSIGNED = "UNSIGNED"
+# Valid distribution channels. "store" (MSIX via Partner Center) is the founder
+# default (2026-07-20); "selfdist" is the dormant Authenticode /dl road.
+WIN_DISTRIBUTIONS = ("store", "selfdist")
 
 
 def is_windows_cfg(cfg):
@@ -198,6 +220,9 @@ def validate_windows(cfg, path):
     mode = cfg.get("build_mode_default", "ci-pull")
     if mode not in ("ci-pull", "rig"):
         fail(f"{path}: build_mode_default must be 'ci-pull' or 'rig'")
+    dist = cfg.get("distribution", "store")
+    if dist not in WIN_DISTRIBUTIONS:
+        fail(f"{path}: distribution must be one of {WIN_DISTRIBUTIONS} (got {dist!r})")
     return cfg
 
 
@@ -240,9 +265,15 @@ def self_check():
     apps = load_all()
     for name, cfg in apps.items():
         if is_windows_cfg(cfg):
-            signed = cfg["signing_identity"] != UNSIGNED
-            print(f"  {name:<16} [windows] repo={cfg['repo']} "
-                  f"signing={'SIGNED' if signed else 'UNSIGNED→STAGED-ONLY'} OK")
+            dist = cfg.get("distribution", "store")
+            if dist == "store":
+                pc = "PARTNER-CENTER-READY" if partner_center_ready() else "no-account→STAGE-LOCAL"
+                print(f"  {name:<16} [windows] repo={cfg['repo']} "
+                      f"dist=store/MSIX ({pc}) OK")
+            else:
+                signed = cfg["signing_identity"] != UNSIGNED
+                print(f"  {name:<16} [windows] repo={cfg['repo']} dist=selfdist "
+                      f"signing={'SIGNED' if signed else 'UNSIGNED→STAGED-ONLY'} OK")
         elif is_ios_cfg(cfg):
             signed = cfg["signing_identity"] != UNSIGNED
             print(f"  {name:<16} [ios]     repo={cfg['repo']} "
@@ -827,11 +858,15 @@ def stage_upload(zip_path, cfg, name, build):
 
 def stage_manifest(cfg, name, build, version, sha, notary_id):
     updates_key = cfg["r2_updates_key"].replace("{build}", build)
+    try:
+        min_supported = int(cfg.get("min_supported_build", 1))
+    except (TypeError, ValueError):
+        min_supported = 1
     manifest = {
         "product": name,
         "latest_build": int(build) if build.isdigit() else build,
         "latest_version": version,
-        "min_supported_build": 1,
+        "min_supported_build": min_supported,
         "download_url": f"{SITE_URL}/{updates_key}",  # /updates/<...> serves R2 key updates/<...> 1:1
         "sha256": sha,
         "notarized": True,
@@ -1027,12 +1062,15 @@ def win_build(cfg, name, build_mode, run_ref):
         fail("win-build: rig mode BLOCKED — no Windows hypervisor on this Mac "
              "(FOUNDER GATE, see windows-rig-20260708.md). Use --build-mode ci-pull.")
     # ci-pull: gh run download of the named workflow artifact.
-    tmpl = cfg.get("build_cmd_ci")
+    # Accept the plan §W0.2 spelling build_cmd_windows as an alias of build_cmd_ci.
+    tmpl = cfg.get("build_cmd_ci") or cfg.get("build_cmd_windows")
     if not tmpl:
-        fail(f"win-build: {name}: no build_cmd_ci configured for ci-pull mode")
-    cmd = tmpl.replace("{run}", run_ref or "").replace("{out}", out)
-    # collapse the empty {run} slot to '--latest' semantics: gh needs a run id OR
-    # the caller passes --run; when omitted we resolve the latest successful run.
+        fail(f"win-build: {name}: no build_cmd_ci/build_cmd_windows configured for ci-pull mode")
+    # Resolve the run id BEFORE substitution so it is injected straight into the
+    # {run} placeholder — no fragile post-hoc surgery on the assembled command
+    # string (the old `replace("download  ", …)` silently dropped the id for any
+    # template whose {run} slot wasn't flanked by single spaces). gh needs a run
+    # id OR the caller passes --run; when omitted we resolve the latest success.
     if not run_ref:
         wf = cfg.get("ci_workflow", "")
         # The repo slug comes from the config's own build_cmd_ci (--repo <slug>),
@@ -1047,8 +1085,14 @@ def win_build(cfg, name, build_mode, run_ref):
                     "--json", "databaseId", "--jq", ".[0].databaseId"]).stdout.strip()
         if not rid:
             fail(f"win-build: no successful '{wf}' run to pull (ci-pull needs a green CI build)")
-        cmd = cmd.replace("download  ", f"download {rid} ")
         run_ref = rid
+    # The resolved/explicit run id must land in the command. A template without a
+    # {run} placeholder would pull an ambiguous 'gh run download' (latest/any) —
+    # fail closed so every ci-pull is pinned to one specific CI run.
+    if "{run}" not in tmpl:
+        fail(f"win-build: {name}: build_cmd_ci must contain the '{{run}}' placeholder "
+             "so the resolved run id pins the download to a specific CI run")
+    cmd = tmpl.replace("{run}", run_ref).replace("{out}", out)
     print(f"  win-build: ci-pull run={run_ref}: {cmd}")
     r = subprocess.run(cmd, shell=True, cwd=SHIP_ROOT)
     if r.returncode != 0:
@@ -1092,9 +1136,11 @@ def win_sign_scan_gauntlet(cfg, name, artifact, build_mode):
     In ci-pull mode (no rig) the scan/gauntlet SKIP-WITH-REASON (can't scan on
     a Mac). Returns the signed artifact path."""
     thumb = cfg["signing_identity"]
-    sign_tmpl = cfg.get("sign_cmd")
+    # Accept the plan §W0.2 spelling sign_windows as an alias of sign_cmd (a
+    # command string only — the fail-closed authority is signing_identity above).
+    sign_tmpl = cfg.get("sign_cmd") or cfg.get("sign_windows")
     if not sign_tmpl:
-        fail(f"win-sign: {name}: signing_identity set but no sign_cmd configured")
+        fail(f"win-sign: {name}: signing_identity set but no sign_cmd/sign_windows configured")
     cmd = sign_tmpl.replace("{thumbprint}", thumb).replace("{artifact}", artifact)
     print(f"  win-sign: {cmd}")
     r = subprocess.run(cmd, shell=True, cwd=SHIP_ROOT)
@@ -1141,6 +1187,113 @@ def win_ship_ledger(name, head, sha, build_mode, go=None):
     print("  win-ledger: appended to ships.jsonl (staged_only=false)")
 
 
+# ---------- Windows STORE-FIRST (MSIX) tail — the primary road (founder ruling 2026-07-20) ----------
+#
+# Design law: an MSIX for the Microsoft Store gets FREE Microsoft signing AT
+# INGESTION (no Authenticode cert — decision windows-lane-go-20260720.md). The
+# fail-closed authority here is NOT a signing cert but the Partner Center
+# account: one developer account per company, founder-only to register, and
+# PENDING. Until the founder places the PARTNER_CENTER_READY marker, every Store
+# submission STAGES locally to ships-staged.jsonl and NOTHING is submitted. When
+# the account exists, a Store submission is still an owner-only public act
+# (CHARTER §3) and needs the per-app founder GO — so the store road is
+# double-gated: partner_center_ready() AND gate_go().
+
+def partner_center_ready():
+    """The Store publish authority. Microsoft-hosted MSIX distribution needs a
+    Partner Center developer account (ONE per company; founder-only to register —
+    decision windows-lane-go-20260720.md, 'Store submissions stage locally until
+    it exists'). The founder places the marker file AFTER registration; absent =>
+    every Store submission STAGES locally. This is the store road's fail-closed
+    sentinel, the analog of signing_identity==UNSIGNED on the self-dist road."""
+    return os.path.isfile(os.path.join(APPS_DIR, "PARTNER_CENTER_READY"))
+
+
+def win_msix_package(cfg, name, artifact, build_mode):
+    """Produce the MSIX. In rig mode run makeappx on the layout; in ci-pull mode
+    makeappx (Windows-only) already ran in the CI/builder snapshot and the pulled
+    artifact IS the .msix, so pass it through with a SKIP-WITH-REASON. Store
+    distribution REQUIRES a .msix — a bare .exe cannot get free Microsoft signing
+    at ingestion. Returns the .msix path."""
+    pkg_tmpl = cfg.get("msix_package_cmd")
+    if build_mode == "rig" and pkg_tmpl:
+        out = os.path.splitext(artifact)[0] + ".msix"
+        cmd = pkg_tmpl.replace("{artifact}", artifact).replace("{out}", out)
+        print(f"  win-msix: {cmd}")
+        r = subprocess.run(cmd, shell=True, cwd=SHIP_ROOT)
+        if r.returncode != 0:
+            fail(f"win-msix: {name}: makeappx failed (rc={r.returncode})")
+        artifact = out
+    else:
+        print("  win-msix: SKIPPED-WITH-REASON (ci-pull mode — makeappx is "
+              "Windows-only; the CI/builder snapshot packs the .msix, pulled as "
+              "built_artifact_windows)")
+    if not artifact.lower().endswith(".msix"):
+        fail(f"win-msix: {name}: store distribution requires a .msix artifact "
+             f"(got {os.path.basename(artifact)}). Point built_artifact_windows at "
+             f"the packaged .msix, or set msix_package_cmd and use --build-mode rig.")
+    return artifact
+
+
+def win_stage_store_submission(cfg, name, head, msix, build_mode):
+    """Fail-closed Store terminus. Copy the .msix to work/ with a -STORE-STAGED
+    suffix, sha it, record to ships-staged.jsonl (channel:store, submitted:false).
+    NOTHING is submitted to Partner Center; ships.jsonl is NOT touched."""
+    os.makedirs(WORK_DIR, exist_ok=True)
+    base = os.path.splitext(os.path.basename(msix))[0]
+    staged = os.path.join(WORK_DIR, f"{base}-STORE-STAGED.msix")
+    shutil.copyfile(msix, staged)
+    sha = sha256_file(staged)
+    line = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "app": name, "platform": "windows", "channel": "store", "commit": head,
+        "sha256": sha, "artifact": os.path.basename(staged),
+        "staged_only": True,
+        "reason": "no Partner Center account yet (FOUNDER GATE) — Microsoft signs the MSIX at ingestion",
+        "build_mode": build_mode, "submitted": False, "manifest_bumped": False,
+    }
+    with open(STAGING_LEDGER, "a") as f:
+        f.write(json.dumps(line) + "\n")
+    print(f"  win-store-stage: {staged}")
+    print(f"  win-store-stage: sha256={sha}")
+    print("  win-store-ledger: appended to ships-staged.jsonl (staged_only=true, channel=store)")
+    print(f"== STAGED-ONLY {name} (windows, STORE/MSIX) — NOT submitted, NO Partner "
+          f"Center account. Registration = FOUNDER GATE. sha={sha[:16]}… ==")
+    return sha
+
+
+def win_store_submit(cfg, name, msix, sha):
+    """Real Partner Center submission. Only reached when partner_center_ready()
+    AND the founder GO both hold. Kept thin so tests can mock it — reaching this
+    stage IS the 'store path reaches submission' assertion. No Authenticode:
+    Microsoft signs the MSIX at ingestion (the 0-cost signing path)."""
+    submit_tmpl = cfg.get("store_submission_cmd")
+    if not submit_tmpl:
+        fail(f"win-store-submit: {name}: Partner Center is ready but no "
+             f"store_submission_cmd is configured")
+    cmd = submit_tmpl.replace("{msix}", msix).replace("{sha}", sha)
+    print(f"  win-store-submit: {cmd}")
+    r = subprocess.run(cmd, shell=True, cwd=SHIP_ROOT)
+    if r.returncode != 0:
+        fail(f"win-store-submit: {name}: Partner Center submission failed (rc={r.returncode})")
+    print(f"  win-store-submit: submitted {os.path.basename(msix)} to Partner Center")
+    return sha
+
+
+def win_store_ledger(name, head, sha, build_mode, go=None):
+    line = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "app": name, "platform": "windows", "channel": "store", "commit": head,
+        "sha256": sha, "staged_only": False, "build_mode": build_mode,
+        "submitted": True, "manifest_bumped": True,
+    }
+    if go:
+        line["go"] = go
+    with open(LEDGER, "a") as f:
+        f.write(json.dumps(line) + "\n")
+    print("  win-store-ledger: appended to ships.jsonl (staged_only=false, channel=store)")
+
+
 def cmd_ship_windows(name, build_mode, run_ref):
     cfg_path = os.path.join(APPS_DIR, name + ".toml")
     if not os.path.isfile(cfg_path):
@@ -1151,10 +1304,31 @@ def cmd_ship_windows(name, build_mode, run_ref):
              f"Use `ship.py {name}` for the macOS road.")
     validate_windows(cfg, cfg_path)
     build_mode = build_mode or cfg.get("build_mode_default", "ci-pull")
-    print(f"== bl-ship {name} [WINDOWS lane, mode={build_mode}] ==")
+    dist = cfg.get("distribution", "store")
+    print(f"== bl-ship {name} [WINDOWS lane, dist={dist}, mode={build_mode}] ==")
     head = win_preflight(cfg, name)
     artifact = win_build(cfg, name, build_mode, run_ref)
-    # ---- THE SIGNING GATE — fail-closed ----
+
+    # ---- STORE-FIRST (MSIX via Partner Center) — the primary road (founder ruling 2026-07-20) ----
+    if dist == "store":
+        msix = win_msix_package(cfg, name, artifact, build_mode)
+        # Fail-closed: no Partner Center account => stage locally, submit NOTHING.
+        if not partner_center_ready():
+            win_stage_store_submission(cfg, name, head, msix, build_mode)
+            return 0  # HARD STOP. No submission. No manifest. ships.jsonl untouched.
+        # Account exists — but a Store submission is still an owner-only public act
+        # (CHARTER §3), so it needs the per-app founder GO just like the Mac/self-dist
+        # roads. Absence is refusal, not permission. NO_BUILD: an MSIX carries no
+        # CFBundleVersion, so a build-bound GO cannot be checked here.
+        go = gate_go(name, NO_BUILD)
+        sha = sha256_file(msix)
+        win_store_submit(cfg, name, msix, sha)
+        win_store_ledger(name, head, sha, build_mode, go)
+        print(f"== SUBMITTED {name} (windows, store/MSIX) sha={sha[:16]}… ==")
+        return 0
+
+    # ---- SELF-DISTRIBUTION (Authenticode /dl) — DORMANT road, fail-closed at the signing gate ----
+    # THE SIGNING GATE — fail-closed
     if cfg["signing_identity"] == UNSIGNED:
         win_stage_unsigned(cfg, name, head, artifact, build_mode)
         return 0  # HARD STOP. No upload. No manifest. ships.jsonl untouched.

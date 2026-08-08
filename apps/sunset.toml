@@ -1,7 +1,11 @@
 # Sunset — Developer-ID lane (gold master verified 2026-07-07)
-# Current 1.0 artifact was shipped by direct notarytool and is served by Cloudflare Pages from
-# BlackLabelAcetate/web/dl/sunset-1.0.zip. The R2/update keys below reserve the same bl-ship
-# naming if Sunset moves onto the fleet updater/R2 lane; the live dl_url records today's truth.
+# 2026-07-12: moved onto the fleet R2 lane. The old Pages delivery
+# (BlackLabelAcetate/web/dl/sunset-1.0.zip) is deliberately CONTAINED — _redirects sends
+# /dl/sunset-1.0.zip -> /thanks/ 302, enforced by tests/test_delivery_containment.py — so buyers
+# now collect Sunset from the blacklabelbots.com member portal, which serves R2 key `sunset.zip`.
+# The keys below were stale placeholders ("sunset-1.0.zip"): ship.py was publishing to a key the
+# portal does not serve, so a new build could never reach a buyer. Verified live 2026-07-12:
+# /dl/sunset.zip?k=… -> 200 (portal), /dl/sunset-1.0.zip -> 404 (unserved).
 repo = "~/BlackLabelAcetate"
 bundle_id = "com.blacklabel.sunset"
 app_name = "Sunset.app"
@@ -11,10 +15,10 @@ arch = "universal2"
 required_entitlements = []
 forbidden_entitlements = ["com.apple.security.app-sandbox"]
 ships_no_data_globs = ["*.sqlite", "*.sqlite3", "*.db", "*.csv", "*.pem", "*.key", "*.tokens", "*secrets*", "*.env", "projects*", "tracks*", "audio*", "*.wav", "*.aif", "*.aiff", "*.mp3", "*.flac", "*.m4a"]
-r2_dl_key = "sunset-1.0.zip"
+r2_dl_key = "sunset.zip"
 r2_updates_key = "updates/sunset/{build}.zip"
 manifest_endpoint = "/api/version/sunset"
-dl_url = "https://sunsetmixing.com/dl/sunset-1.0.zip"
+dl_url = "https://blacklabelbots.com/dl/sunset.zip?k=c76acb879e8fe0d8d69a9b081e01758d"
 ports = []
 test_cmd = "bash tests/run_audio_regression.sh"
 entitlements_file = "Sunset.entitlements"

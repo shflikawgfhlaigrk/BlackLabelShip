@@ -14,6 +14,7 @@ r2_dl_key = "marketing.zip"
 r2_updates_key = "updates/marketing/{build}.zip"
 manifest_endpoint = "/api/version/marketing"
 dl_url = "https://blacklabelbots.com/dl/marketing.zip?k=c76acb879e8fe0d8d69a9b081e01758d"
+min_supported_build = "73"
 ports = []
 test_cmd = "bash Tests/run.sh"
 entitlements_file = "Sources/app-devid.entitlements"

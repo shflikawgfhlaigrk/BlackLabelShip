@@ -41,7 +41,7 @@ APPS = {
         "first_run": """FIRST RUN
 1. Open the app. The data backend starts itself - nothing to launch separately.
 2. Connect YOUR OWN platform login when prompted (WealthCharts, TopStep,
-   Tradovate, or TradingView). The app starts EMPTY
+   or Tradovate). The app starts EMPTY
    until your feed connects - it ships with no market data and no history.
 3. Signals appear once your live feed is flowing.
 
@@ -121,17 +121,21 @@ HONEST NOTES
         "updates": UPD_INAPP,
     },
     "homefront": {
-        "title": "HOMEFRONT",
+        "title": "VIGIL",
         "first_run": """FIRST RUN
-1. Open the app.
-2. Allow "Local Network" access when macOS asks - that's how Homefront finds
-   your smart devices (it never leaves your LAN).
-3. Grant microphone/camera permissions only if you turn on the sensing
-   features that use them.
+1. Open Vigil. It runs on your Mac alone - no account, no cloud, and no
+   hardware required to begin. Your Mac's own sensing powers Security presence
+   right away.
+2. Allow "Local Network" access when macOS asks - that's how Vigil finds the
+   smart devices already on your Wi-Fi (nothing ever leaves your LAN).
+3. Grant microphone/camera only if you turn on the room-sensing features that
+   use them - they're clearly labeled in-app and stay off until you enable them.
 
 HONEST NOTES
-- Room-sensing (sonar/pose) features are experimental and labeled as such
-  in-app. Through-wall sensing requires optional sensor hardware (ESP32 hub).
+- The live house map and through-wall room sensing draw from optional Vigil
+  sensor nodes (ESP32). Until a node is connected the app says so honestly and
+  runs its Mac-only sensing - it never shows invented rooms, devices, or vitals.
+- Room-sensing (sonar/pose) features are experimental and labeled as such.
 - Nothing is uploaded anywhere; your home stays in your home.
 """,
         "updates": UPD_DASH,

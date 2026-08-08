@@ -45,6 +45,15 @@ ci_artifact_name = "circuit-windows-UNSIGNED-STAGED-ONLY"
 # where the built/pulled installer lands inside the pulled/produced artifact dir
 built_artifact_windows = "circuit-windows-UNSIGNED-STAGED-ONLY.exe"
 
+# --- distribution channel (founder ruling 2026-07-20: STORE-FIRST via MSIX) ---
+# Company default is "store" (MSIX → Partner Center, Microsoft signs free at
+# ingestion). Circuit stays on "selfdist" (the dormant Authenticode /dl road)
+# because its windows-spike.yml CI still emits a bare .exe, not a signed-at-
+# ingestion .msix. Flip this to "store" the moment circuit's CI produces an
+# .msix (makeappx step) and point built_artifact_windows at it — that MSIX
+# packaging is the circuit-engineer W1 lane, not the ship tool's job.
+distribution = "selfdist"
+
 # --- signing (FOUNDER GATE — money). UNSIGNED => STAGED-ONLY hard stop. ------
 # When a cert exists, set signing_identity to the cert thumbprint / subject and
 # signtool signs every nested .exe/.dll (bundled Node) + the installer. Until
