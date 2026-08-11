@@ -4,7 +4,7 @@
 repo = "~/BlackLabelHQ"
 bundle_id = "com.blacklabel.hq"
 app_name = "Black Label HQ.app"
-build_cmd = "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer SIGN_ID=\"05494FC15FB97F422400BC32DF6D67FC2D28855B\" /bin/bash macos/build.command"
+build_cmd = "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer SIGN_ID=05494FC15FB97F422400BC32DF6D67FC2D28855B /bin/bash macos/build.command"
 built_app_path = "macos/build/Black Label HQ.app"
 arch = "universal2"
 required_entitlements = ["com.apple.security.network.client"]

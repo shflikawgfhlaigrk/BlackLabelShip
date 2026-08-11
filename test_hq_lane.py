@@ -12,6 +12,11 @@ class HQLaneContractTest(unittest.TestCase):
             "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer",
             config["build_cmd"],
         )
+        self.assertIn(
+            "SIGN_ID=05494FC15FB97F422400BC32DF6D67FC2D28855B",
+            config["build_cmd"],
+        )
+        self.assertNotIn('SIGN_ID=\\"', config["build_cmd"])
 
 
 if __name__ == "__main__":
