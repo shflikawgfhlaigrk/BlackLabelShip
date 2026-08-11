@@ -1,0 +1,20 @@
+# Black Label HQ — private Founder and senior-hire macOS client.
+# The app is a universal Swift shell over the Access-protected HQ origin and
+# prefers the owner Mac's loopback runtime when it is available.
+repo = "~/BlackLabelHQ"
+bundle_id = "com.blacklabel.hq"
+app_name = "Black Label HQ.app"
+build_cmd = "SIGN_ID=\"Developer ID Application: MICHAEL THOMAS LYNWOOD BURNS BARBER (745ZPGFRA5)\" /bin/bash macos/build.command"
+built_app_path = "macos/build/Black Label HQ.app"
+arch = "universal2"
+required_entitlements = ["com.apple.security.network.client"]
+forbidden_entitlements = ["com.apple.security.app-sandbox", "com.apple.security.get-task-allow", "com.apple.security.cs.disable-library-validation", "com.apple.security.cs.allow-dyld-environment-variables"]
+ships_no_data_globs = ["*.sqlite", "*.sqlite3", "*.db", "*.csv", "*.pem", "*.key", "*.tokens", "*secrets*", "*.env", "*recent*", "*history*"]
+r2_dl_key = "hq.zip"
+r2_updates_key = "updates/hq/{build}.zip"
+manifest_endpoint = "/api/version/hq"
+dl_url = "https://blacklabelbots.com/dl/hq.zip?k=c76acb879e8fe0d8d69a9b081e01758d"
+min_supported_build = "3"
+ports = ["8791"]
+test_cmd = "npm test"
+entitlements_file = "macos/Sources/app-devid.entitlements"
