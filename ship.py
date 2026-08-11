@@ -893,10 +893,13 @@ def stage_manifest(cfg, name, build, version, sha, notary_id):
     return manifest
 
 
-def stage_ledger(name, head, build, sha, notary_id, dry_run, go=None):
+def stage_ledger(name, head, build, version, sha, notary_id, dry_run, go=None):
+    version = str(version or "").strip()
+    if not version:
+        fail(f"{name}: immutable ship ledger requires the signed bundle version")
     line = {
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "app": name, "commit": head, "build": build, "sha256": sha,
+        "app": name, "commit": head, "build": build, "version": version, "sha256": sha,
         "notarization_id": notary_id, "dry_run": dry_run,
         "gates": [g.__name__ for g in LOCAL_GATES],
     }
@@ -956,7 +959,7 @@ def cmd_publish_staged(name, notary_id, dry_run):
     # while a same-number/different-bytes republish is refused.
     gate_build_number(name, build, sha)
     if dry_run:
-        stage_ledger(name, head, build, sha, notary_id, True, go)
+        stage_ledger(name, head, build, version, sha, notary_id, True, go)
         print(f"DRY RUN — not uploaded. ({name} build {build} v{version} ready)")
         return 0
 
@@ -965,7 +968,7 @@ def cmd_publish_staged(name, notary_id, dry_run):
     if err:
         fail(f"{name}: {err} — manifest NOT bumped")
     stage_manifest(cfg, name, build, version, sha, notary_id)
-    stage_ledger(name, head, build, sha, notary_id, False, go)
+    stage_ledger(name, head, build, version, sha, notary_id, False, go)
     print(f"== SHIPPED {name} build {build} v{version} sha={sha[:16]}… ==")
     return 0
 
@@ -1009,7 +1012,7 @@ def cmd_ship(name, dry_run):
     sha = pack(app, zip_path, app_key=name)
     print(f"  pack: {zip_path} sha256={sha}")
     if dry_run:
-        stage_ledger(name, head, build, sha, notary_id, True, go)
+        stage_ledger(name, head, build, version, sha, notary_id, True, go)
         print(f"DRY RUN — not uploaded. ({name} build {build} v{version} ready)")
         return 0
     stage_upload(zip_path, cfg, name, build)
@@ -1017,7 +1020,7 @@ def cmd_ship(name, dry_run):
     if err:
         fail(f"{name}: {err} — manifest NOT bumped")
     stage_manifest(cfg, name, build, version, sha, notary_id)
-    stage_ledger(name, head, build, sha, notary_id, False, go)
+    stage_ledger(name, head, build, version, sha, notary_id, False, go)
     print(f"== SHIPPED {name} build {build} v{version} sha={sha[:16]}… ==")
     return 0
 

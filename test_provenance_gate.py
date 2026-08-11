@@ -279,7 +279,7 @@ def test_dry_run_never_writes_the_real_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(ship, "LEDGER", str(real))
     monkeypatch.setattr(ship, "DRY_LEDGER", str(tmp_path / "ships-dryrun.jsonl"))
 
-    ship.stage_ledger("sovereign", "3168563", "39", "abc123", "notary-1", True, "GO — Michael")
+    ship.stage_ledger("sovereign", "3168563", "39", "1.0", "abc123", "notary-1", True, "GO — Michael")
 
     assert real.read_bytes() == before, "a dry run wrote into the ship-of-record"
     assert json.loads((tmp_path / "ships-dryrun.jsonl").read_text())["dry_run"] is True
@@ -290,10 +290,22 @@ def test_a_real_ship_does_write_the_ledger_and_records_the_go(tmp_path, monkeypa
     monkeypatch.setattr(ship, "LEDGER", str(real))
     monkeypatch.setattr(ship, "DRY_LEDGER", str(tmp_path / "ships-dryrun.jsonl"))
 
-    ship.stage_ledger("sovereign", "3168563", "39", "abc123", "notary-1", False, "GO — Michael")
+    ship.stage_ledger("sovereign", "3168563", "39", "1.0", "abc123", "notary-1", False, "GO — Michael")
 
     row = json.loads(real.read_text())
     assert row["dry_run"] is False and row["commit"] == "3168563" and row["go"] == "GO — Michael"
+    assert row["version"] == "1.0"
+
+
+def test_ship_ledger_refuses_missing_bundle_version(tmp_path, monkeypatch):
+    real = tmp_path / "ships.jsonl"
+    monkeypatch.setattr(ship, "LEDGER", str(real))
+    monkeypatch.setattr(ship, "DRY_LEDGER", str(tmp_path / "ships-dryrun.jsonl"))
+
+    with pytest.raises(SystemExit):
+        ship.stage_ledger("sovereign", "3168563", "39", "", "abc123", "notary-1", False, "GO — Michael")
+
+    assert not real.exists()
 
 
 # ---------- the build-number gate (an update nobody can install is not a ship) ----------
