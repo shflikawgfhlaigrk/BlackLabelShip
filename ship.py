@@ -22,7 +22,7 @@ Windows lane (STAGED-ONLY, fail-closed — see apps/circuit-windows.toml):
 
 python3-stdlib only (works on system py3.9: tomllib fallback parser built in).
 """
-import sys, os, re, json, glob, hashlib, subprocess, plistlib, shutil, datetime
+import sys, os, re, json, glob, hashlib, subprocess, plistlib, shutil, datetime, tempfile
 
 SHIP_ROOT = os.path.dirname(os.path.abspath(__file__))
 APPS_DIR = os.path.join(SHIP_ROOT, "apps")
@@ -37,6 +37,7 @@ STAGING_LEDGER = os.path.join(SHIP_ROOT, "ships-staged.jsonl")  # unsigned Windo
 # have to repair after every rehearsal is a file that will eventually be repaired wrong. Dry runs
 # now land here instead, and ships.jsonl is only ever touched by a real, GO-authorized publish.
 DRY_LEDGER = os.path.join(SHIP_ROOT, "ships-dryrun.jsonl")
+INSTALL_EVIDENCE_DIR = os.path.join(SHIP_ROOT, "evidence", "installs")
 
 REQUIRED_KEYS = [
     "repo", "bundle_id", "app_name", "build_cmd", "built_app_path", "arch",
@@ -291,6 +292,76 @@ def _run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
+def _git_worktree_identity(path, label):
+    """Return the canonical worktree root and shared git-common-dir.
+
+    A source override is deliberately narrower than "some git checkout": it
+    must be a worktree attached to the configured repository.  Comparing the
+    git common directory gives that property without relying on mutable remote
+    names or URLs.
+    """
+    root = os.path.realpath(expand(path))
+    if not os.path.isdir(root):
+        fail(f"{label}: repository path does not exist or is not a directory: {root}")
+    top_result = _run(["git", "-C", root, "rev-parse", "--show-toplevel"])
+    if top_result.returncode != 0:
+        fail(f"{label}: not a git worktree: {root}")
+    top = os.path.realpath(top_result.stdout.strip())
+    if top != root:
+        fail(f"{label}: --repo must name the worktree root, not a subdirectory: {root}")
+    common_result = _run(["git", "-C", top, "rev-parse", "--git-common-dir"])
+    if common_result.returncode != 0 or not common_result.stdout.strip():
+        fail(f"{label}: cannot resolve git common directory for {top}")
+    common_raw = common_result.stdout.strip()
+    common = common_raw if os.path.isabs(common_raw) else os.path.join(top, common_raw)
+    return top, os.path.realpath(common)
+
+
+def resolve_repo_override(name, cfg, repo_override):
+    """Validate and canonicalize one invocation's source worktree override."""
+    if not isinstance(repo_override, str) or not repo_override.strip():
+        fail(f"{name}: --repo requires a non-empty path")
+    configured_root, configured_common = _git_worktree_identity(
+        cfg["repo"], f"{name}: configured repo"
+    )
+    override_root, override_common = _git_worktree_identity(
+        repo_override, f"{name}: --repo"
+    )
+    if override_common != configured_common:
+        fail(
+            f"{name}: --repo {override_root} is not a worktree of configured app repo "
+            f"{configured_root}; refusing to build the wrong product tree"
+        )
+    return override_root
+
+
+def load_mac_app_config(name, repo_override=None):
+    """Load a Mac config, applying a non-persistent repo override to a copy."""
+    cfg_path = os.path.join(APPS_DIR, name + ".toml")
+    if not os.path.isfile(cfg_path):
+        fail(f"no config for app {name!r} ({cfg_path})")
+    cfg = validate(load_config(cfg_path), cfg_path)
+    if repo_override is None:
+        return cfg, cfg_path
+    selected = resolve_repo_override(name, cfg, repo_override)
+    overridden = dict(cfg)
+    overridden["repo"] = selected
+    return validate(overridden, cfg_path), cfg_path
+
+
+def _source_identity(repo, name):
+    root, _common = _git_worktree_identity(repo, f"{name}: source repo")
+    commit = _run(["git", "-C", root, "rev-parse", "HEAD"])
+    tree = _run(["git", "-C", root, "rev-parse", "HEAD^{tree}"])
+    if commit.returncode != 0 or tree.returncode != 0:
+        fail(f"{name}: cannot resolve source commit/tree for {root}")
+    return {
+        "source_repo": root,
+        "source_commit": commit.stdout.strip(),
+        "source_tree": tree.stdout.strip(),
+    }
+
+
 def gate_gatekeeper(app_path, cfg=None):
     r = _run(["spctl", "-a", "-vv", "-t", "install", app_path])
     ok = "accepted" in (r.stderr + r.stdout)
@@ -300,6 +371,24 @@ def gate_gatekeeper(app_path, cfg=None):
 def gate_seal(app_path, cfg=None):
     r = _run(["codesign", "--verify", "--deep", "--strict", app_path])
     return None if r.returncode == 0 else f"seal: codesign --verify failed: {(r.stderr or r.stdout).strip()[:300]}"
+
+
+def gate_developer_id(app_path, cfg=None):
+    """Require a Developer ID Application signature from Black Label's team."""
+    r = _run(["codesign", "-dv", "--verbose=4", app_path])
+    detail = (r.stderr or r.stdout).strip()
+    if r.returncode != 0:
+        return f"developer-id: codesign inspection failed: {detail[:300]}"
+    if "Authority=Developer ID Application:" not in detail:
+        return "developer-id: bundle is not signed with Developer ID Application"
+    team = None
+    for line in detail.splitlines():
+        if line.startswith("TeamIdentifier="):
+            team = line.partition("=")[2].strip()
+            break
+    if team != TEAM_ID:
+        return f"developer-id: TeamIdentifier {team or 'missing'} != {TEAM_ID}"
+    return None
 
 
 def _read_entitlements(app_path):
@@ -614,29 +703,48 @@ def _exec_path(app_path):
     return os.path.join(app_path, "Contents", "MacOS", pl["CFBundleExecutable"])
 
 
-def stage_provenance(app_path, name, head):
+def stage_provenance(app_path, name, head, source_repo=None):
     """Stamp the build-time commit + executable hash beside the staged .app."""
     data = {
         "app": name, "commit": head,
         "exec_sha256": sha256_file(_exec_path(app_path)),
         "built": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
+    if source_repo is not None:
+        identity = _source_identity(source_repo, name)
+        if not identity["source_commit"].startswith(str(head)):
+            fail(
+                f"{name}: preflight commit {head} is not HEAD "
+                f"{identity['source_commit']} in {identity['source_repo']}"
+            )
+        data.update(identity)
     with open(os.path.join(os.path.dirname(app_path), PROVENANCE), "w") as f:
         json.dump(data, f, indent=2)
     print(f"  provenance: commit {head} bound to exec sha {data['exec_sha256'][:16]}…")
     return data
 
 
-def gate_provenance(app_path, name, expect_commit=None):
+def _load_provenance_file(prov, name):
+    try:
+        with open(prov) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        fail(f"{name}: cannot read valid {PROVENANCE}: {exc}")
+    if not isinstance(data, dict):
+        fail(f"{name}: {PROVENANCE} must be a JSON object")
+    return data
+
+
+def gate_provenance(app_path, name, expect_commit=None, expect_source_repo=None,
+                    expect_source_commit=None, provenance_path=None):
     """FAIL CLOSED unless the packed bytes provably carry the commit we are about to record."""
-    prov = os.path.join(os.path.dirname(app_path), PROVENANCE)
+    prov = provenance_path or os.path.join(os.path.dirname(app_path), PROVENANCE)
     if not os.path.isfile(prov):
         fail(f"{name}: no {PROVENANCE} beside the staged artifact — the commit these bytes were built "
              f"from is UNKNOWN. (This is the b38 shape: an artifact staged before the provenance gate, "
              f"or hand-placed.) Rebuild with `ship.py {name}` so the commit is stamped at build time. "
              f"Refusing to guess it from git HEAD.")
-    with open(prov) as f:
-        data = json.load(f)
+    data = _load_provenance_file(prov, name)
     if data.get("app") != name:
         fail(f"{name}: provenance describes app {data.get('app')!r} — the wrong artifact is staged.")
     actual = sha256_file(_exec_path(app_path))
@@ -644,11 +752,92 @@ def gate_provenance(app_path, name, expect_commit=None):
         fail(f"{name}: provenance/artifact MISMATCH — {PROVENANCE} describes an executable hashing to "
              f"{str(data.get('exec_sha256'))[:16]}… but the staged binary hashes to {actual[:16]}…. The "
              f"artifact was rebuilt or swapped after it was stamped; refusing to ship it as {data.get('commit')}.")
-    if expect_commit and data["commit"] != expect_commit:
+    if data.get("bundle_sha256"):
+        actual_bundle = sha256_tree(app_path)
+        if data["bundle_sha256"] != actual_bundle:
+            fail(
+                f"{name}: provenance/artifact bundle MISMATCH — {PROVENANCE} describes "
+                f"{data['bundle_sha256'][:16]}… but staged bundle hashes to "
+                f"{actual_bundle[:16]}…"
+            )
+    if expect_commit and data.get("commit") != expect_commit:
         fail(f"{name}: the tree moved during the build — the bytes carry {data['commit']} but HEAD is now "
              f"{expect_commit}. Rebuild from a settled tree so the ledger cannot lie about the commit.")
+    if expect_source_repo is not None:
+        wanted_repo = os.path.realpath(expand(expect_source_repo))
+        carried_repo = data.get("source_repo")
+        if not carried_repo or os.path.realpath(carried_repo) != wanted_repo:
+            fail(
+                f"{name}: staged provenance source repo {carried_repo!r} does not match "
+                f"this invocation's --repo {wanted_repo!r}"
+            )
+    if expect_source_commit is not None and data.get("source_commit") != expect_source_commit:
+        fail(
+            f"{name}: staged provenance source commit {data.get('source_commit')!r} does not "
+            f"match this invocation's source HEAD {expect_source_commit!r}"
+        )
     print(f"  gate_provenance: bytes provably carry commit {data['commit']} (exec sha verified) OK")
     return data["commit"]
+
+
+def sha256_tree(root):
+    """Content hash a bundle without depending on inode metadata or xattrs."""
+    root = os.path.abspath(root)
+    if not os.path.isdir(root):
+        fail(f"bundle hash: not a directory: {root}")
+    digest = hashlib.sha256()
+    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+        dirs.sort()
+        files.sort()
+        for name in dirs + files:
+            path = os.path.join(current, name)
+            rel = os.path.relpath(path, root).replace(os.sep, "/")
+            if os.path.islink(path):
+                digest.update(b"L\0" + rel.encode("utf-8") + b"\0")
+                digest.update(os.readlink(path).encode("utf-8") + b"\0")
+            elif os.path.isfile(path):
+                digest.update(b"F\0" + rel.encode("utf-8") + b"\0")
+                with open(path, "rb") as handle:
+                    for chunk in iter(lambda: handle.read(1 << 20), b""):
+                        digest.update(chunk)
+            elif os.path.isdir(path):
+                digest.update(b"D\0" + rel.encode("utf-8") + b"\0")
+    return digest.hexdigest()
+
+
+def finalize_provenance(app_path, name, notary_id, cfg, verify_staple=True):
+    """Bind the final, stapled bundle and immutable bundle identity to source."""
+    prov = os.path.join(os.path.dirname(app_path), PROVENANCE)
+    gate_provenance(app_path, name)
+    if verify_staple:
+        staple_error = gate_staple(app_path, cfg)
+        if staple_error:
+            fail(f"{name}: cannot finalize provenance: {staple_error}")
+    data = _load_provenance_file(prov, name)
+    build, version = app_build_number(app_path)
+    with open(os.path.join(app_path, "Contents", "Info.plist"), "rb") as handle:
+        info = plistlib.load(handle)
+    if info.get("CFBundleIdentifier") != cfg["bundle_id"]:
+        fail(
+            f"{name}: bundle identifier {info.get('CFBundleIdentifier')!r} does not "
+            f"match config {cfg['bundle_id']!r}"
+        )
+    data.update({
+        "bundle_id": cfg["bundle_id"],
+        "build": build,
+        "version": version,
+        "bundle_sha256": sha256_tree(app_path),
+        "notarization_id": notary_id,
+        "team_id": TEAM_ID,
+        "provenance_finalized": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    })
+    with open(prov, "w") as handle:
+        json.dump(data, handle, indent=2)
+    print(
+        f"  provenance: final bundle sha {data['bundle_sha256'][:16]}… "
+        f"build {build} v{version} notary {notary_id}"
+    )
+    return data
 
 
 # ---------- the build number must be NEW, or the ship is inert ----------
@@ -911,7 +1100,269 @@ def stage_ledger(name, head, build, version, sha, notary_id, dry_run, go=None):
     print(f"  ledger: appended to {os.path.basename(target)}")
 
 
-def cmd_publish_staged(name, notary_id, dry_run):
+# ---------- verified candidate install (never rebuilds) ----------
+
+def _safe_install_path(path, label):
+    """Normalize a path while refusing lexical traversal and symlink components."""
+    if not isinstance(path, str) or not path.strip():
+        fail(f"install: {label} path is required")
+    expanded = expand(path)
+    if ".." in expanded.split(os.sep):
+        fail(f"install: {label} path traversal is not allowed: {path}")
+    absolute = os.path.abspath(expanded)
+    current = os.path.sep
+    for part in absolute.split(os.sep)[1:]:
+        current = os.path.join(current, part)
+        if os.path.lexists(current) and os.path.islink(current):
+            fail(f"install: {label} path contains symlink component: {current}")
+    return absolute
+
+
+def _bundle_info(app_path, name):
+    info_path = os.path.join(app_path, "Contents", "Info.plist")
+    try:
+        with open(info_path, "rb") as handle:
+            info = plistlib.load(handle)
+    except (OSError, plistlib.InvalidFileException) as exc:
+        fail(f"install: {name}: invalid bundle Info.plist: {exc}")
+    return info
+
+
+def verify_install_artifact(name, cfg, app_path, provenance_path):
+    """Verify bytes, identity, Developer ID, staple and Gatekeeper trust."""
+    gate_provenance(app_path, name, provenance_path=provenance_path)
+    data = _load_provenance_file(provenance_path, name)
+    required = (
+        "commit", "source_repo", "source_commit", "source_tree", "exec_sha256",
+        "bundle_sha256", "bundle_id", "build", "version", "notarization_id",
+        "team_id",
+    )
+    missing = [key for key in required if not data.get(key)]
+    if missing:
+        fail(f"install: {name}: provenance missing required final fields {missing}")
+    if not data["source_commit"].startswith(str(data["commit"])):
+        fail(f"install: {name}: short commit does not belong to provenance source commit")
+    if not os.path.isabs(data["source_repo"]):
+        fail(f"install: {name}: provenance source_repo must be canonical and absolute")
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", data["source_commit"]):
+        fail(f"install: {name}: invalid source commit identity")
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", data["source_tree"]):
+        fail(f"install: {name}: invalid source tree identity")
+    info = _bundle_info(app_path, name)
+    bundle_id = info.get("CFBundleIdentifier")
+    build = str(info.get("CFBundleVersion", ""))
+    version = str(info.get("CFBundleShortVersionString", ""))
+    if bundle_id != cfg["bundle_id"] or data["bundle_id"] != cfg["bundle_id"]:
+        fail(
+            f"install: {name}: bundle identifier mismatch "
+            f"(bundle={bundle_id!r}, provenance={data.get('bundle_id')!r}, "
+            f"config={cfg['bundle_id']!r})"
+        )
+    if build != str(data["build"]) or version != str(data["version"]):
+        fail(
+            f"install: {name}: build/version mismatch between bundle "
+            f"({build}/{version}) and provenance ({data.get('build')}/{data.get('version')})"
+        )
+    if data["team_id"] != TEAM_ID:
+        fail(f"install: {name}: provenance team {data['team_id']} != {TEAM_ID}")
+    gates = (
+        ("seal", gate_seal),
+        ("developer-id", gate_developer_id),
+        ("staple", gate_staple),
+        ("gatekeeper", gate_gatekeeper),
+    )
+    for label, gate in gates:
+        error = gate(app_path, cfg)
+        if error:
+            fail(f"install: {name}: {label} gate failed: {error}")
+    return {
+        "provenance": data,
+        "bundle_sha256": sha256_tree(app_path),
+        "exec_sha256": sha256_file(_exec_path(app_path)),
+        "build": build,
+        "version": version,
+        "bundle_id": bundle_id,
+    }
+
+
+def _write_install_receipt(receipt):
+    os.makedirs(INSTALL_EVIDENCE_DIR, mode=0o700, exist_ok=True)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    target = os.path.join(
+        INSTALL_EVIDENCE_DIR,
+        f"{receipt['app']}-install-{stamp}-{os.getpid()}.json",
+    )
+    temporary = target + ".tmp"
+    with open(temporary, "w") as handle:
+        json.dump(receipt, handle, indent=2, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, target)
+    return target
+
+
+def install_candidate(name, cfg, candidate_path, provenance_path, destination,
+                      allow_applications=False):
+    """Install a prebuilt candidate by verified, rollback-safe atomic rename."""
+    candidate = _safe_install_path(candidate_path, "candidate")
+    provenance = _safe_install_path(provenance_path, "provenance")
+    destination = _safe_install_path(destination, "destination")
+    if os.path.basename(candidate) != cfg["app_name"] or not os.path.isdir(candidate):
+        fail(f"install: {name}: candidate must be the {cfg['app_name']} bundle")
+    expected_provenance = os.path.join(os.path.dirname(candidate), PROVENANCE)
+    if provenance != expected_provenance or not os.path.isfile(provenance):
+        fail(
+            f"install: {name}: provenance must be the regular file beside the candidate: "
+            f"{expected_provenance}"
+        )
+    if os.path.basename(destination) != cfg["app_name"]:
+        fail(f"install: {name}: destination must end in {cfg['app_name']}")
+    applications_root = os.path.realpath("/Applications")
+    try:
+        under_applications = os.path.commonpath(
+            [os.path.realpath(destination), applications_root]
+        ) == applications_root
+    except ValueError:
+        under_applications = False
+    real_destination = os.path.join("/Applications", cfg["app_name"])
+    if under_applications and not allow_applications:
+        fail("install: writing under /Applications requires --install-hq-candidate")
+    if allow_applications and destination != real_destination:
+        fail(f"install: real install destination is fixed at {real_destination}")
+    if os.path.commonpath([candidate, destination]) in (candidate, destination):
+        fail("install: candidate and destination must be separate trees")
+
+    candidate_result = verify_install_artifact(name, cfg, candidate, provenance)
+    provenance_sha = sha256_file(provenance)
+    parent = os.path.dirname(destination)
+    _safe_install_path(parent, "destination parent")
+    os.makedirs(parent, mode=0o755, exist_ok=True)
+    _safe_install_path(parent, "destination parent")
+
+    staging_root = tempfile.mkdtemp(prefix=f".{name}-install-", dir=parent)
+    staged_copy = os.path.join(staging_root, cfg["app_name"])
+    backup = None
+    moved_destination = False
+    installed_candidate = False
+    receipt = {
+        "schema_version": 1,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "app": name,
+        "status": "prepared",
+        "source": {
+            "repo": candidate_result["provenance"]["source_repo"],
+            "commit": candidate_result["provenance"]["source_commit"],
+            "tree": candidate_result["provenance"]["source_tree"],
+        },
+        "bundle": {
+            "id": candidate_result["bundle_id"],
+            "build": candidate_result["build"],
+            "version": candidate_result["version"],
+        },
+        "candidate": {
+            "path": candidate,
+            "bundle_sha256": candidate_result["bundle_sha256"],
+            "exec_sha256": candidate_result["exec_sha256"],
+        },
+        "provenance": {
+            "path": provenance,
+            "sha256": provenance_sha,
+            "finalized": candidate_result["provenance"].get("provenance_finalized"),
+        },
+        "signing": {"developer_id": True, "team_id": TEAM_ID},
+        "notary": {
+            "stapled": True,
+            "gatekeeper_accepted": True,
+            "submission_id": candidate_result["provenance"]["notarization_id"],
+        },
+        "destination": destination,
+        "backup": {"path": None, "kept": False},
+        "installed": {"bundle_sha256": None, "exec_sha256": None},
+        "rollback": {"attempted": False, "outcome": "not_required"},
+    }
+    try:
+        shutil.copytree(candidate, staged_copy, symlinks=True, copy_function=shutil.copy2)
+        staged_result = verify_install_artifact(name, cfg, staged_copy, provenance)
+        if staged_result["bundle_sha256"] != candidate_result["bundle_sha256"]:
+            fail(f"install: {name}: staged copy hash differs from candidate")
+
+        if os.path.lexists(destination):
+            if os.path.islink(destination) or not os.path.isdir(destination):
+                fail(f"install: {name}: existing destination is not a regular app directory")
+            backup_stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%Y%m%dT%H%M%S.%fZ"
+            )
+            backup = destination + f".backup-{backup_stamp}"
+            if os.path.lexists(backup):
+                fail(f"install: {name}: backup path collision: {backup}")
+            os.rename(destination, backup)
+            moved_destination = True
+            receipt["backup"] = {"path": backup, "kept": True}
+
+        os.rename(staged_copy, destination)
+        installed_candidate = True
+        installed_result = verify_install_artifact(name, cfg, destination, provenance)
+        if installed_result["bundle_sha256"] != candidate_result["bundle_sha256"]:
+            fail(f"install: {name}: installed bundle hash differs from candidate")
+        receipt["installed"] = {
+            "bundle_sha256": installed_result["bundle_sha256"],
+            "exec_sha256": installed_result["exec_sha256"],
+        }
+        receipt["status"] = "installed"
+        receipt_path = _write_install_receipt(receipt)
+        print(f"  install: verified candidate installed at {destination}")
+        print(f"  install: receipt {receipt_path}")
+        return receipt_path
+    except (Exception, SystemExit) as exc:
+        receipt["rollback"]["attempted"] = True
+        failed_copy = os.path.join(staging_root, "failed-installed.app")
+        try:
+            if installed_candidate and os.path.lexists(destination):
+                os.rename(destination, failed_copy)
+            if moved_destination and backup and os.path.lexists(backup):
+                os.rename(backup, destination)
+                receipt["rollback"]["outcome"] = "restored_backup"
+                receipt["backup"]["kept"] = False
+            else:
+                receipt["rollback"]["outcome"] = "restored_absent"
+            receipt["status"] = "rolled_back"
+        except Exception as rollback_error:
+            receipt["rollback"]["outcome"] = f"rollback_failed: {rollback_error}"
+            receipt["status"] = "rollback_failed"
+        _write_install_receipt(receipt)
+        if isinstance(exc, SystemExit):
+            raise
+        fail(f"install: {name}: installation failed and rollback ran: {exc}")
+    finally:
+        if os.path.isdir(staging_root):
+            shutil.rmtree(staging_root)
+
+
+def cmd_install_candidate(name, candidate_path=None, provenance_path=None,
+                          destination=None, allow_applications=False):
+    cfg, _cfg_path = load_mac_app_config(name)
+    if name != "hq":
+        fail("--install-candidate currently supports the HQ staged candidate only")
+    if destination is None:
+        fail("--install-candidate requires --destination <exact-app-path>")
+    candidate = candidate_path or os.path.join(
+        WORK_DIR, f"{name}-stage", cfg["app_name"]
+    )
+    provenance = provenance_path or os.path.join(
+        os.path.dirname(candidate), PROVENANCE
+    )
+    install_candidate(
+        name,
+        cfg,
+        candidate,
+        provenance,
+        destination,
+        allow_applications=allow_applications,
+    )
+    return 0
+
+
+def cmd_publish_staged(name, notary_id, dry_run, repo_override=None):
     """Resume the road at stage 4 for an artifact already built+notarized+stapled.
 
     The train can die between notarize (minutes-long, Apple-side) and upload; the
@@ -922,10 +1373,7 @@ def cmd_publish_staged(name, notary_id, dry_run):
     the live gate still re-downloads and Gatekeeper-checks the quarantined copy.
     An artifact that is not already stapled CANNOT publish here -- it fails the gate.
     """
-    cfg_path = os.path.join(APPS_DIR, name + ".toml")
-    if not os.path.isfile(cfg_path):
-        fail(f"no config for app {name!r} ({cfg_path})")
-    cfg = validate(load_config(cfg_path), cfg_path)
+    cfg, cfg_path = load_mac_app_config(name, repo_override=repo_override)
     print(f"== bl-ship {name} PUBLISH-STAGED (no rebuild) {'(DRY RUN)' if dry_run else ''} ==")
 
     hold = os.path.join(APPS_DIR, f"{name}.HOLD")
@@ -945,7 +1393,24 @@ def cmd_publish_staged(name, notary_id, dry_run):
     print(f"  staged: {app} (build {build} v{version})")
 
     print("  gates:")
-    head = gate_provenance(app, name)
+    source_expect = None
+    if repo_override is not None:
+        dirty_result = _run(["git", "-C", cfg["repo"], "status", "--porcelain"])
+        if dirty_result.returncode != 0:
+            fail(f"{name}: cannot inspect --repo working tree")
+        dirty = [line for line in dirty_result.stdout.splitlines() if line.strip()]
+        if dirty:
+            fail(
+                f"publish-staged: {name}: --repo working tree dirty ({len(dirty)} entries) — "
+                f"commit first (provenance)"
+            )
+        source_expect = _source_identity(cfg["repo"], name)
+    head = gate_provenance(
+        app,
+        name,
+        expect_source_repo=source_expect["source_repo"] if source_expect else None,
+        expect_source_commit=source_expect["source_commit"] if source_expect else None,
+    )
     # `build` is read from the staged bundle above — a GO that names a build is checked against the
     # artifact actually on the road, not against whatever the dispatch believed was staged.
     go = gate_go(name, build)
@@ -973,11 +1438,8 @@ def cmd_publish_staged(name, notary_id, dry_run):
     return 0
 
 
-def cmd_ship(name, dry_run):
-    cfg_path = os.path.join(APPS_DIR, name + ".toml")
-    if not os.path.isfile(cfg_path):
-        fail(f"no config for app {name!r} ({cfg_path})")
-    cfg = validate(load_config(cfg_path), cfg_path)
+def cmd_ship(name, dry_run, repo_override=None):
+    cfg, cfg_path = load_mac_app_config(name, repo_override=repo_override)
     print(f"== bl-ship {name} {'(DRY RUN)' if dry_run else ''} ==")
     head = stage_preflight(cfg, name)
     app = stage_build(cfg, name)
@@ -1000,8 +1462,9 @@ def cmd_ship(name, dry_run):
     # gates go. (No sha yet — and none is needed: rebuilt bytes are never the shipped bytes.)
     gate_build_number(name, build)
     # Stamp the commit onto the bytes NOW, while we know for certain which source produced them.
-    stage_provenance(app, name, head)
+    stage_provenance(app, name, head, source_repo=cfg["repo"])
     notary_id = stage_notarize(app, cfg, name)
+    finalize_provenance(app, name, notary_id, cfg)
     print("  gates:")
     if not run_local_gates(app, cfg):
         fail(f"{name}: local gates failed — nothing uploads")
@@ -1409,13 +1872,33 @@ def cmd_site(dry_run):
 
 # ---------- cli ----------
 
+def _cli_value(argv, option):
+    count = argv.count(option)
+    if count > 1:
+        fail(f"{option} may be provided only once")
+    if count == 0:
+        return None
+    index = argv.index(option)
+    if index + 1 >= len(argv) or argv[index + 1].startswith("--"):
+        fail(f"{option} requires a value")
+    return argv[index + 1]
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
-        print("usage: ship.py --self-check | ship.py <app> [--dry-run] | ship.py site [--dry-run]")
+        print("usage: ship.py --self-check | ship.py <app> [--repo PATH] [--dry-run] | ship.py site [--dry-run]")
+        print("       ship.py --publish-staged <app> --notary-id <id> [--repo PATH] [--dry-run]")
+        print("       ship.py --install-candidate hq --destination <exact-app-path> [--candidate <app>]")
+        print("               [--provenance <provenance.json>]")
+        print("       ship.py --install-hq-candidate [--candidate <app>] [--provenance <json>]")
+        print("               (explicit verified install to /Applications; never rebuilds)")
         print("       ship.py --windows <win-app> [--build-mode ci-pull|rig] [--run <id>]")
         print("               (Windows lane: STAGED-ONLY & fail-closed while unsigned)")
         return 0
+    if "--repo" in argv and (
+        argv[0] == "site" or (argv[0].startswith("--") and argv[0] != "--publish-staged")
+    ):
+        fail("--repo is supported only by a Mac app build or --publish-staged invocation")
     if argv[0] == "--self-check":
         return self_check()
     if argv[0] == "--windows":
@@ -1430,6 +1913,31 @@ def main(argv):
         if "--run" in argv:
             run_ref = argv[argv.index("--run") + 1]
         return cmd_ship_windows(name, build_mode, run_ref)
+    if argv[0] in ("--install-candidate", "--install-hq-candidate"):
+        candidate = _cli_value(argv, "--candidate")
+        provenance = _cli_value(argv, "--provenance")
+        destination = _cli_value(argv, "--destination")
+        if argv[0] == "--install-hq-candidate":
+            if destination is not None:
+                fail("--install-hq-candidate uses the fixed /Applications destination")
+            return cmd_install_candidate(
+                "hq",
+                candidate_path=candidate,
+                provenance_path=provenance,
+                destination="/Applications/Black Label HQ.app",
+                allow_applications=True,
+            )
+        if len(argv) < 2 or argv[1].startswith("--"):
+            fail("--install-candidate requires an app config name")
+        if destination is None:
+            fail("--install-candidate requires --destination <exact-app-path>")
+        return cmd_install_candidate(
+            argv[1],
+            candidate_path=candidate,
+            provenance_path=provenance,
+            destination=destination,
+            allow_applications=False,
+        )
     if argv[0] == "--publish-staged":
         # ship.py --publish-staged <app> --notary-id <id> [--dry-run]
         if len(argv) < 2:
@@ -1437,8 +1945,11 @@ def main(argv):
         name = argv[1]
         if "--notary-id" not in argv:
             fail("--publish-staged requires --notary-id <submission-id> (provenance for the ledger)")
-        nid = argv[argv.index("--notary-id") + 1]
-        return cmd_publish_staged(name, nid, "--dry-run" in argv)
+        nid = _cli_value(argv, "--notary-id")
+        repo_override = _cli_value(argv, "--repo")
+        return cmd_publish_staged(
+            name, nid, "--dry-run" in argv, repo_override=repo_override
+        )
     if argv[0] == "--gates":
         # ship.py --gates <path-to.app> <app-config-name>  (standalone gate run)
         app_path, name = argv[1], argv[2]
@@ -1448,7 +1959,8 @@ def main(argv):
     dry = "--dry-run" in argv
     if argv[0] == "site":
         return cmd_site(dry)
-    return cmd_ship(argv[0], dry)
+    repo_override = _cli_value(argv, "--repo")
+    return cmd_ship(argv[0], dry, repo_override=repo_override)
 
 
 if __name__ == "__main__":
