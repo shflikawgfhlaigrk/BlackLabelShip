@@ -22,7 +22,7 @@ Windows lane (STAGED-ONLY, fail-closed — see apps/circuit-windows.toml):
 
 python3-stdlib only (works on system py3.9: tomllib fallback parser built in).
 """
-import sys, os, re, json, glob, hashlib, subprocess, plistlib, shutil, datetime, tempfile
+import sys, os, re, json, glob, hashlib, subprocess, plistlib, shutil, datetime, tempfile, ctypes, errno
 
 SHIP_ROOT = os.path.dirname(os.path.abspath(__file__))
 APPS_DIR = os.path.join(SHIP_ROOT, "apps")
@@ -300,6 +300,8 @@ def _git_worktree_identity(path, label):
     git common directory gives that property without relying on mutable remote
     names or URLs.
     """
+    if not isinstance(path, str) or not path.strip():
+        fail(f"{label}: repository path must be a non-empty string")
     root = os.path.realpath(expand(path))
     if not os.path.isdir(root):
         fail(f"{label}: repository path does not exist or is not a directory: {root}")
@@ -362,10 +364,54 @@ def _source_identity(repo, name):
     }
 
 
+def _git_commit_tree(repo, commit, name):
+    """Resolve a full commit and its exact tree from a real repository object."""
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", commit):
+        fail(f"{name}: provenance source commit is not a full Git object id")
+    exists = _run(["git", "-C", repo, "cat-file", "-e", f"{commit}^{{commit}}"])
+    if exists.returncode != 0:
+        fail(f"{name}: provenance source commit {commit} does not exist in {repo}")
+    canonical = _run(["git", "-C", repo, "rev-parse", f"{commit}^{{commit}}"])
+    tree = _run(["git", "-C", repo, "rev-parse", f"{commit}^{{tree}}"])
+    if canonical.returncode != 0 or tree.returncode != 0:
+        fail(f"{name}: cannot resolve provenance commit/tree in {repo}")
+    return canonical.stdout.strip(), tree.stdout.strip()
+
+
+def verify_provenance_source(cfg, data, name):
+    """Prove provenance points into the configured app's Git object family."""
+    configured_root, configured_common = _git_worktree_identity(
+        cfg["repo"], f"{name}: configured repo"
+    )
+    carried_root, carried_common = _git_worktree_identity(
+        data.get("source_repo"), f"{name}: provenance source repo"
+    )
+    if data.get("source_repo") != carried_root:
+        fail(f"{name}: provenance source repo is not a canonical absolute worktree path")
+    if carried_common != configured_common:
+        fail(
+            f"{name}: provenance repo {carried_root} is unrelated to configured app repo "
+            f"{configured_root}"
+        )
+    commit, tree = _git_commit_tree(carried_root, data.get("source_commit"), name)
+    if data.get("source_commit") != commit:
+        fail(f"{name}: provenance source commit is not canonical")
+    if data.get("source_tree") != tree:
+        fail(
+            f"{name}: provenance source tree {data.get('source_tree')!r} does not match "
+            f"Git tree {tree!r} for commit {commit}"
+        )
+    if not commit.startswith(str(data.get("commit", ""))):
+        fail(f"{name}: short build commit is not a prefix of verified source commit")
+    return {"source_repo": carried_root, "source_commit": commit, "source_tree": tree}
+
+
 def gate_gatekeeper(app_path, cfg=None):
     r = _run(["spctl", "-a", "-vv", "-t", "install", app_path])
-    ok = "accepted" in (r.stderr + r.stdout)
-    return None if ok else f"gatekeeper: spctl rejected: {(r.stderr or r.stdout).strip()[:300]}"
+    detail = (r.stderr + "\n" + r.stdout).strip()
+    accepted = re.search(r"(?mi)^.+:\s*accepted\s*$", detail) is not None
+    ok = r.returncode == 0 and accepted
+    return None if ok else f"gatekeeper: spctl rejected: {detail[:300]}"
 
 
 def gate_seal(app_path, cfg=None):
@@ -736,7 +782,8 @@ def _load_provenance_file(prov, name):
 
 
 def gate_provenance(app_path, name, expect_commit=None, expect_source_repo=None,
-                    expect_source_commit=None, provenance_path=None):
+                    expect_source_commit=None, expect_source_tree=None,
+                    provenance_path=None):
     """FAIL CLOSED unless the packed bytes provably carry the commit we are about to record."""
     prov = provenance_path or os.path.join(os.path.dirname(app_path), PROVENANCE)
     if not os.path.isfile(prov):
@@ -776,6 +823,22 @@ def gate_provenance(app_path, name, expect_commit=None, expect_source_repo=None,
             f"{name}: staged provenance source commit {data.get('source_commit')!r} does not "
             f"match this invocation's source HEAD {expect_source_commit!r}"
         )
+    if expect_source_tree is not None and data.get("source_tree") != expect_source_tree:
+        fail(
+            f"{name}: staged provenance source tree {data.get('source_tree')!r} does not "
+            f"match this invocation's source tree {expect_source_tree!r}"
+        )
+    if expect_source_repo is not None and expect_source_commit is not None:
+        canonical_commit, derived_tree = _git_commit_tree(
+            wanted_repo, expect_source_commit, name
+        )
+        if canonical_commit != expect_source_commit:
+            fail(f"{name}: expected source commit is not canonical")
+        if expect_source_tree is None or derived_tree != expect_source_tree:
+            fail(
+                f"{name}: expected source tree is absent or does not match Git commit "
+                f"{expect_source_commit}"
+            )
     print(f"  gate_provenance: bytes provably carry commit {data['commit']} (exec sha verified) OK")
     return data["commit"]
 
@@ -1140,14 +1203,7 @@ def verify_install_artifact(name, cfg, app_path, provenance_path):
     missing = [key for key in required if not data.get(key)]
     if missing:
         fail(f"install: {name}: provenance missing required final fields {missing}")
-    if not data["source_commit"].startswith(str(data["commit"])):
-        fail(f"install: {name}: short commit does not belong to provenance source commit")
-    if not os.path.isabs(data["source_repo"]):
-        fail(f"install: {name}: provenance source_repo must be canonical and absolute")
-    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", data["source_commit"]):
-        fail(f"install: {name}: invalid source commit identity")
-    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", data["source_tree"]):
-        fail(f"install: {name}: invalid source tree identity")
+    verified_source = verify_provenance_source(cfg, data, name)
     info = _bundle_info(app_path, name)
     bundle_id = info.get("CFBundleIdentifier")
     build = str(info.get("CFBundleVersion", ""))
@@ -1177,6 +1233,7 @@ def verify_install_artifact(name, cfg, app_path, provenance_path):
             fail(f"install: {name}: {label} gate failed: {error}")
     return {
         "provenance": data,
+        "verified_source": verified_source,
         "bundle_sha256": sha256_tree(app_path),
         "exec_sha256": sha256_file(_exec_path(app_path)),
         "build": build,
@@ -1201,9 +1258,118 @@ def _write_install_receipt(receipt):
     return target
 
 
+class AtomicExchangeUnavailable(RuntimeError):
+    pass
+
+
+def atomic_exchange_paths(left, right):
+    """Atomically exchange two same-filesystem paths on macOS.
+
+    renameatx_np(RENAME_SWAP) keeps both names continuously populated: a power
+    loss observes either the old destination or the new one, never a missing
+    live app path.
+    """
+    if sys.platform != "darwin":
+        raise AtomicExchangeUnavailable("renameatx_np(RENAME_SWAP) is macOS-only")
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameatx = getattr(libc, "renameatx_np", None)
+    if renameatx is None:
+        raise AtomicExchangeUnavailable("renameatx_np is unavailable")
+    renameatx.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                          ctypes.c_char_p, ctypes.c_uint]
+    renameatx.restype = ctypes.c_int
+    at_fdcwd = -2
+    rename_swap = 0x00000002
+    result = renameatx(
+        at_fdcwd, os.fsencode(left), at_fdcwd, os.fsencode(right), rename_swap
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error in (errno.ENOSYS, errno.ENOTSUP, errno.EINVAL):
+        raise AtomicExchangeUnavailable(os.strerror(error))
+    raise OSError(error, os.strerror(error), f"{left} <-> {right}")
+
+
+def replace_existing_destination(staged_copy, destination, backup,
+                                 allow_unsafe_test_fallback=False):
+    """Replace an existing destination, requiring atomic exchange in production."""
+    try:
+        atomic_exchange_paths(staged_copy, destination)
+    except AtomicExchangeUnavailable as exc:
+        if not allow_unsafe_test_fallback:
+            fail(
+                f"install: atomic replacement unavailable ({exc}); production destination "
+                f"was left untouched"
+            )
+        # Test/non-production fallback only. Catching BaseException closes the
+        # interrupt window in-process, but this path is intentionally forbidden
+        # for /Applications because power loss could still land between renames.
+        os.rename(destination, backup)
+        try:
+            os.rename(staged_copy, destination)
+        except BaseException:
+            if not os.path.lexists(destination) and os.path.lexists(backup):
+                os.rename(backup, destination)
+            raise
+        return "test_two_rename"
+    # After the atomic exchange, the old destination is at staged_copy. Moving
+    # it to its explicit backup name cannot make destination disappear.
+    os.rename(staged_copy, backup)
+    return "atomic_exchange"
+
+
+def _bundle_hash_or_none(path):
+    try:
+        return sha256_tree(path) if os.path.isdir(path) else None
+    except (Exception, SystemExit):
+        return None
+
+
+def _exec_hash_or_none(path):
+    try:
+        return sha256_file(_exec_path(path)) if os.path.isdir(path) else None
+    except (Exception, SystemExit):
+        return None
+
+
+def _restore_previous_destination(destination, sources, previous_bundle_sha,
+                                  allow_unsafe_test_fallback):
+    """Restore the verified previous bundle without exposing an absent live path."""
+    if _bundle_hash_or_none(destination) == previous_bundle_sha:
+        return "destination_untouched"
+    source = next(
+        (path for path in sources if _bundle_hash_or_none(path) == previous_bundle_sha),
+        None,
+    )
+    if source is None:
+        raise RuntimeError("previous destination bytes cannot be located for rollback")
+    if os.path.lexists(destination):
+        try:
+            atomic_exchange_paths(destination, source)
+        except AtomicExchangeUnavailable as exc:
+            if not allow_unsafe_test_fallback:
+                raise RuntimeError(
+                    f"atomic rollback unavailable for production destination: {exc}"
+                )
+            failed = source + ".failed-candidate"
+            os.rename(destination, failed)
+            try:
+                os.rename(source, destination)
+            except BaseException:
+                if not os.path.lexists(destination) and os.path.lexists(failed):
+                    os.rename(failed, destination)
+                raise
+    else:
+        os.rename(source, destination)
+    if _bundle_hash_or_none(destination) != previous_bundle_sha:
+        raise RuntimeError("rollback restored bytes do not match pre-install destination")
+    return "restored_backup"
+
+
 def install_candidate(name, cfg, candidate_path, provenance_path, destination,
                       allow_applications=False):
-    """Install a prebuilt candidate by verified, rollback-safe atomic rename."""
+    """Install a prebuilt candidate with a continuously populated live path."""
     candidate = _safe_install_path(candidate_path, "candidate")
     provenance = _safe_install_path(provenance_path, "provenance")
     destination = _safe_install_path(destination, "destination")
@@ -1239,20 +1405,33 @@ def install_candidate(name, cfg, candidate_path, provenance_path, destination,
     os.makedirs(parent, mode=0o755, exist_ok=True)
     _safe_install_path(parent, "destination parent")
 
+    destination_existed = os.path.lexists(destination)
+    if destination_existed and (
+        os.path.islink(destination) or not os.path.isdir(destination)
+    ):
+        fail(f"install: {name}: existing destination is not a regular app directory")
+    previous_bundle_sha = _bundle_hash_or_none(destination)
+    previous_exec_sha = _exec_hash_or_none(destination)
+    if destination_existed and (not previous_bundle_sha or not previous_exec_sha):
+        fail(f"install: {name}: cannot hash existing destination for backup evidence")
+    backup_stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y%m%dT%H%M%S.%fZ"
+    )
+    backup = destination + f".backup-{backup_stamp}" if destination_existed else None
+    if backup and os.path.lexists(backup):
+        fail(f"install: {name}: backup path collision: {backup}")
+
     staging_root = tempfile.mkdtemp(prefix=f".{name}-install-", dir=parent)
     staged_copy = os.path.join(staging_root, cfg["app_name"])
-    backup = None
-    moved_destination = False
-    installed_candidate = False
     receipt = {
         "schema_version": 1,
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "app": name,
         "status": "prepared",
         "source": {
-            "repo": candidate_result["provenance"]["source_repo"],
-            "commit": candidate_result["provenance"]["source_commit"],
-            "tree": candidate_result["provenance"]["source_tree"],
+            "repo": candidate_result["verified_source"]["source_repo"],
+            "commit": candidate_result["verified_source"]["source_commit"],
+            "tree": candidate_result["verified_source"]["source_tree"],
         },
         "bundle": {
             "id": candidate_result["bundle_id"],
@@ -1276,7 +1455,18 @@ def install_candidate(name, cfg, candidate_path, provenance_path, destination,
             "submission_id": candidate_result["provenance"]["notarization_id"],
         },
         "destination": destination,
-        "backup": {"path": None, "kept": False},
+        "pre_install_destination": {
+            "present": destination_existed,
+            "bundle_sha256": previous_bundle_sha,
+            "exec_sha256": previous_exec_sha,
+        },
+        "backup": {
+            "path": backup,
+            "kept": False,
+            "bundle_sha256": previous_bundle_sha,
+            "exec_sha256": previous_exec_sha,
+        },
+        "replacement": {"mode": None, "destination_continuously_present": True},
         "installed": {"bundle_sha256": None, "exec_sha256": None},
         "rollback": {"attempted": False, "outcome": "not_required"},
     }
@@ -1286,21 +1476,17 @@ def install_candidate(name, cfg, candidate_path, provenance_path, destination,
         if staged_result["bundle_sha256"] != candidate_result["bundle_sha256"]:
             fail(f"install: {name}: staged copy hash differs from candidate")
 
-        if os.path.lexists(destination):
-            if os.path.islink(destination) or not os.path.isdir(destination):
-                fail(f"install: {name}: existing destination is not a regular app directory")
-            backup_stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
-                "%Y%m%dT%H%M%S.%fZ"
+        if destination_existed:
+            receipt["replacement"]["mode"] = replace_existing_destination(
+                staged_copy,
+                destination,
+                backup,
+                allow_unsafe_test_fallback=not allow_applications,
             )
-            backup = destination + f".backup-{backup_stamp}"
-            if os.path.lexists(backup):
-                fail(f"install: {name}: backup path collision: {backup}")
-            os.rename(destination, backup)
-            moved_destination = True
-            receipt["backup"] = {"path": backup, "kept": True}
-
-        os.rename(staged_copy, destination)
-        installed_candidate = True
+            receipt["backup"]["kept"] = True
+        else:
+            os.rename(staged_copy, destination)
+            receipt["replacement"]["mode"] = "atomic_first_install_rename"
         installed_result = verify_install_artifact(name, cfg, destination, provenance)
         if installed_result["bundle_sha256"] != candidate_result["bundle_sha256"]:
             fail(f"install: {name}: installed bundle hash differs from candidate")
@@ -1313,28 +1499,51 @@ def install_candidate(name, cfg, candidate_path, provenance_path, destination,
         print(f"  install: verified candidate installed at {destination}")
         print(f"  install: receipt {receipt_path}")
         return receipt_path
-    except (Exception, SystemExit) as exc:
-        receipt["rollback"]["attempted"] = True
-        failed_copy = os.path.join(staging_root, "failed-installed.app")
+    except BaseException as exc:
         try:
-            if installed_candidate and os.path.lexists(destination):
-                os.rename(destination, failed_copy)
-            if moved_destination and backup and os.path.lexists(backup):
-                os.rename(backup, destination)
-                receipt["rollback"]["outcome"] = "restored_backup"
-                receipt["backup"]["kept"] = False
+            current_sha = _bundle_hash_or_none(destination)
+            if destination_existed:
+                outcome = _restore_previous_destination(
+                    destination,
+                    [backup, staged_copy],
+                    previous_bundle_sha,
+                    allow_unsafe_test_fallback=not allow_applications,
+                )
+                receipt["rollback"] = {
+                    "attempted": outcome != "destination_untouched",
+                    "outcome": outcome,
+                }
+                if outcome == "restored_backup":
+                    receipt["backup"]["kept"] = False
+                    if backup and os.path.isdir(backup):
+                        shutil.rmtree(backup)
             else:
-                receipt["rollback"]["outcome"] = "restored_absent"
-            receipt["status"] = "rolled_back"
-        except Exception as rollback_error:
+                if current_sha == candidate_result["bundle_sha256"]:
+                    failed_copy = os.path.join(staging_root, "failed-installed.app")
+                    os.rename(destination, failed_copy)
+                    receipt["rollback"] = {
+                        "attempted": True,
+                        "outcome": "restored_absent",
+                    }
+                else:
+                    receipt["rollback"] = {
+                        "attempted": False,
+                        "outcome": "destination_untouched",
+                    }
+            receipt["status"] = (
+                "rolled_back" if receipt["rollback"]["attempted"]
+                else "failed_pre_swap"
+            )
+        except BaseException as rollback_error:
             receipt["rollback"]["outcome"] = f"rollback_failed: {rollback_error}"
+            receipt["rollback"]["attempted"] = True
             receipt["status"] = "rollback_failed"
         _write_install_receipt(receipt)
-        if isinstance(exc, SystemExit):
+        if isinstance(exc, (SystemExit, KeyboardInterrupt)):
             raise
         fail(f"install: {name}: installation failed and rollback ran: {exc}")
     finally:
-        if os.path.isdir(staging_root):
+        if os.path.isdir(staging_root) and receipt.get("status") != "rollback_failed":
             shutil.rmtree(staging_root)
 
 
@@ -1410,6 +1619,7 @@ def cmd_publish_staged(name, notary_id, dry_run, repo_override=None):
         name,
         expect_source_repo=source_expect["source_repo"] if source_expect else None,
         expect_source_commit=source_expect["source_commit"] if source_expect else None,
+        expect_source_tree=source_expect["source_tree"] if source_expect else None,
     )
     # `build` is read from the staged bundle above — a GO that names a build is checked against the
     # artifact actually on the road, not against whatever the dispatch believed was staged.
@@ -1883,6 +2093,33 @@ def _cli_value(argv, option):
         fail(f"{option} requires a value")
     return argv[index + 1]
 
+
+def _parse_exact_options(tokens, value_options=(), flag_options=(), lane="command"):
+    """Parse only declared options; reject every duplicate or stray token."""
+    values = {}
+    flags = set()
+    value_options = set(value_options)
+    flag_options = set(flag_options)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in value_options:
+            if token in values:
+                fail(f"{lane}: {token} may be provided only once")
+            if index + 1 >= len(tokens) or tokens[index + 1].startswith("--"):
+                fail(f"{lane}: {token} requires a value")
+            values[token] = tokens[index + 1]
+            index += 2
+            continue
+        if token in flag_options:
+            if token in flags:
+                fail(f"{lane}: {token} may be provided only once")
+            flags.add(token)
+            index += 1
+            continue
+        fail(f"{lane}: unrecognized or unexpected argument {token!r}")
+    return values, flags
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
@@ -1895,11 +2132,9 @@ def main(argv):
         print("       ship.py --windows <win-app> [--build-mode ci-pull|rig] [--run <id>]")
         print("               (Windows lane: STAGED-ONLY & fail-closed while unsigned)")
         return 0
-    if "--repo" in argv and (
-        argv[0] == "site" or (argv[0].startswith("--") and argv[0] != "--publish-staged")
-    ):
-        fail("--repo is supported only by a Mac app build or --publish-staged invocation")
     if argv[0] == "--self-check":
+        if len(argv) != 1:
+            fail("--self-check takes no arguments")
         return self_check()
     if argv[0] == "--windows":
         # ship.py --windows <win-app> [--build-mode ci-pull|rig] [--run <id>]
@@ -1914,28 +2149,33 @@ def main(argv):
             run_ref = argv[argv.index("--run") + 1]
         return cmd_ship_windows(name, build_mode, run_ref)
     if argv[0] in ("--install-candidate", "--install-hq-candidate"):
-        candidate = _cli_value(argv, "--candidate")
-        provenance = _cli_value(argv, "--provenance")
-        destination = _cli_value(argv, "--destination")
         if argv[0] == "--install-hq-candidate":
-            if destination is not None:
-                fail("--install-hq-candidate uses the fixed /Applications destination")
+            values, _flags = _parse_exact_options(
+                argv[1:],
+                value_options=("--candidate", "--provenance"),
+                lane="--install-hq-candidate",
+            )
             return cmd_install_candidate(
                 "hq",
-                candidate_path=candidate,
-                provenance_path=provenance,
+                candidate_path=values.get("--candidate"),
+                provenance_path=values.get("--provenance"),
                 destination="/Applications/Black Label HQ.app",
                 allow_applications=True,
             )
         if len(argv) < 2 or argv[1].startswith("--"):
             fail("--install-candidate requires an app config name")
-        if destination is None:
+        values, _flags = _parse_exact_options(
+            argv[2:],
+            value_options=("--candidate", "--provenance", "--destination"),
+            lane="--install-candidate",
+        )
+        if "--destination" not in values:
             fail("--install-candidate requires --destination <exact-app-path>")
         return cmd_install_candidate(
             argv[1],
-            candidate_path=candidate,
-            provenance_path=provenance,
-            destination=destination,
+            candidate_path=values.get("--candidate"),
+            provenance_path=values.get("--provenance"),
+            destination=values["--destination"],
             allow_applications=False,
         )
     if argv[0] == "--publish-staged":
@@ -1943,12 +2183,19 @@ def main(argv):
         if len(argv) < 2:
             fail("--publish-staged requires an app, e.g. `ship.py --publish-staged marketing`")
         name = argv[1]
-        if "--notary-id" not in argv:
+        values, flags = _parse_exact_options(
+            argv[2:],
+            value_options=("--notary-id", "--repo"),
+            flag_options=("--dry-run",),
+            lane="--publish-staged",
+        )
+        if "--notary-id" not in values:
             fail("--publish-staged requires --notary-id <submission-id> (provenance for the ledger)")
-        nid = _cli_value(argv, "--notary-id")
-        repo_override = _cli_value(argv, "--repo")
         return cmd_publish_staged(
-            name, nid, "--dry-run" in argv, repo_override=repo_override
+            name,
+            values["--notary-id"],
+            "--dry-run" in flags,
+            repo_override=values.get("--repo"),
         )
     if argv[0] == "--gates":
         # ship.py --gates <path-to.app> <app-config-name>  (standalone gate run)
@@ -1956,11 +2203,22 @@ def main(argv):
         cfg = validate(load_config(os.path.join(APPS_DIR, name + ".toml")),
                        os.path.join(APPS_DIR, name + ".toml"))
         return 0 if run_local_gates(app_path, cfg) else 1
-    dry = "--dry-run" in argv
     if argv[0] == "site":
-        return cmd_site(dry)
-    repo_override = _cli_value(argv, "--repo")
-    return cmd_ship(argv[0], dry, repo_override=repo_override)
+        _values, flags = _parse_exact_options(
+            argv[1:], flag_options=("--dry-run",), lane="site"
+        )
+        return cmd_site("--dry-run" in flags)
+    if argv[0].startswith("--"):
+        fail(f"unknown command {argv[0]!r}")
+    values, flags = _parse_exact_options(
+        argv[1:],
+        value_options=("--repo",),
+        flag_options=("--dry-run",),
+        lane=f"ship {argv[0]}",
+    )
+    return cmd_ship(
+        argv[0], "--dry-run" in flags, repo_override=values.get("--repo")
+    )
 
 
 if __name__ == "__main__":

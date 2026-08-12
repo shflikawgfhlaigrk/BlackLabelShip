@@ -36,10 +36,18 @@ python3 ship.py --install-hq-candidate
 ```
 
 The installer never rebuilds. It verifies executable and whole-bundle hashes
-against provenance, source commit/tree, bundle ID/build/version, Developer ID
-team, stapling, and Gatekeeper before changing the destination. It copies into
-a same-filesystem staging directory, repeats the gates, keeps the prior app as
-an explicit timestamped backup, atomically renames the candidate into place,
-then verifies the installed bytes and trust again. Any failed post-mutation
-gate restores the previous app. Machine-readable receipts are written beneath
-`evidence/installs/`.
+against provenance, resolves the recorded source worktree into the configured
+HQ repository family, proves the recorded commit exists, derives and compares
+its Git tree, and checks bundle ID/build/version, Developer ID team, stapling,
+and Gatekeeper before changing the destination. It copies into a
+same-filesystem staging directory and repeats the gates. Existing production
+installs are replaced with macOS `renameatx_np(RENAME_SWAP)`, so the live path
+is continuously populated across a crash or power loss; production refuses to
+replace when atomic exchange is unavailable. The previous app is retained as
+an explicit timestamped backup with pre-install bundle and executable hashes.
+Any caught post-exchange failure or interruption atomically restores it.
+Machine-readable receipts are written beneath `evidence/installs/`.
+
+The custom `--destination` lane may use a caught two-rename fallback on a
+platform without atomic exchange. That fallback is test/non-production only;
+the `/Applications` command never uses it.

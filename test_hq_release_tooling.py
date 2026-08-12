@@ -200,6 +200,56 @@ def test_publish_binding_refuses_provenance_from_a_different_worktree_path(tmp_p
         )
 
 
+def test_publish_binding_refuses_a_tampered_source_tree(tmp_path):
+    repo = _git_repo(tmp_path)
+    app = _app(tmp_path / "hq-stage")
+    short = _git(repo, "rev-parse", "--short", "HEAD")
+    ship.stage_provenance(str(app), "hq", short, source_repo=str(repo))
+    provenance = app.parent / ship.PROVENANCE
+    data = json.loads(provenance.read_text())
+    data["source_tree"] = "b" * 40
+    provenance.write_text(json.dumps(data))
+
+    with pytest.raises(SystemExit):
+        ship.gate_provenance(
+            str(app),
+            "hq",
+            expect_source_repo=str(repo),
+            expect_source_commit=_git(repo, "rev-parse", "HEAD"),
+            expect_source_tree=_git(repo, "rev-parse", "HEAD^{tree}"),
+        )
+
+
+def test_publish_staged_route_refuses_tampered_tree_before_go_or_upload(
+    tmp_path, monkeypatch
+):
+    repo = _git_repo(tmp_path)
+    work = tmp_path / "work"
+    app = _app(work / "hq-stage")
+    short = _git(repo, "rev-parse", "--short", "HEAD")
+    ship.stage_provenance(str(app), "hq", short, source_repo=str(repo))
+    provenance = app.parent / ship.PROVENANCE
+    data = json.loads(provenance.read_text())
+    data["source_tree"] = "c" * 40
+    provenance.write_text(json.dumps(data))
+    monkeypatch.setattr(ship, "WORK_DIR", str(work))
+    monkeypatch.setattr(
+        ship,
+        "load_mac_app_config",
+        lambda name, repo_override=None: (_cfg(repo), "/tmp/hq.toml"),
+    )
+    monkeypatch.setattr(
+        ship,
+        "gate_go",
+        lambda *_args, **_kwargs: pytest.fail("GO gate reached after bad source tree"),
+    )
+
+    with pytest.raises(SystemExit):
+        ship.cmd_publish_staged(
+            "hq", "notary-fixture-23", True, repo_override=str(repo)
+        )
+
+
 def test_cli_repo_requires_exactly_one_value():
     with pytest.raises(SystemExit):
         ship.main(["hq", "--repo"])
@@ -211,6 +261,53 @@ def test_repo_override_is_refused_instead_of_ignored_on_site_lane(monkeypatch):
     monkeypatch.setattr(ship, "cmd_site", lambda _dry: 0)
     with pytest.raises(SystemExit):
         ship.main(["site", "--repo", "/tmp/ignored", "--dry-run"])
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["hq", "unexpected"],
+        ["hq", "--unknown"],
+        ["hq", "--dry-run", "--dry-run"],
+        ["hq", "--repo", "/tmp/hq", "extra"],
+    ],
+)
+def test_build_cli_rejects_every_unconsumed_or_duplicate_token(argv, monkeypatch):
+    monkeypatch.setattr(ship, "cmd_ship", lambda *_args, **_kwargs: 0)
+    with pytest.raises(SystemExit):
+        ship.main(argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--publish-staged", "hq", "--notary-id", "id", "unexpected"],
+        ["--publish-staged", "hq", "--notary-id", "id", "--unknown"],
+        ["--publish-staged", "hq", "--notary-id", "id", "--dry-run", "--dry-run"],
+        ["--publish-staged", "hq", "--notary-id", "id", "--notary-id", "other"],
+    ],
+)
+def test_publish_cli_rejects_every_unconsumed_or_duplicate_token(argv, monkeypatch):
+    monkeypatch.setattr(ship, "cmd_publish_staged", lambda *_args, **_kwargs: 0)
+    with pytest.raises(SystemExit):
+        ship.main(argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--install-candidate", "hq", "--destination", "/tmp/HQ.app", "extra"],
+        ["--install-candidate", "hq", "--destination", "/tmp/HQ.app", "--unknown"],
+        ["--install-candidate", "hq", "--destination", "/one", "--destination", "/two"],
+        ["--install-hq-candidate", "unexpected"],
+        ["--install-hq-candidate", "--unknown"],
+        ["--install-hq-candidate", "--candidate", "/one", "--candidate", "/two"],
+    ],
+)
+def test_install_cli_rejects_every_unconsumed_or_duplicate_token(argv, monkeypatch):
+    monkeypatch.setattr(ship, "cmd_install_candidate", lambda *_args, **_kwargs: 0)
+    with pytest.raises(SystemExit):
+        ship.main(argv)
 
 
 def test_installer_copies_verified_candidate_keeps_backup_and_writes_receipt(
@@ -245,7 +342,52 @@ def test_installer_copies_verified_candidate_keeps_backup_and_writes_receipt(
     assert receipt["signing"]["developer_id"] is True
     assert receipt["notary"]["submission_id"] == "notary-fixture-23"
     assert receipt["rollback"]["outcome"] == "not_required"
+    assert receipt["replacement"]["mode"] == "atomic_exchange"
+    assert receipt["replacement"]["destination_continuously_present"] is True
     assert os.path.isdir(receipt["backup"]["path"])
+    assert receipt["backup"]["bundle_sha256"]
+    assert receipt["backup"]["exec_sha256"]
+
+
+def test_installer_refuses_provenance_from_an_unrelated_repo_before_mutation(
+    tmp_path, monkeypatch
+):
+    configured = _git_repo(tmp_path, "configured")
+    unrelated = _git_repo(tmp_path, "unrelated")
+    candidate = _app(tmp_path / "work" / "hq-stage")
+    provenance = _trusted_provenance(candidate, unrelated)
+    destination = tmp_path / "Applications" / "Black Label HQ.app"
+    _trust_external_tools(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        ship.install_candidate(
+            "hq", _cfg(configured), str(candidate), str(provenance),
+            str(destination), allow_applications=False,
+        )
+
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("field,value", [("source_commit", "a" * 40), ("source_tree", "b" * 40)])
+def test_installer_refuses_tampered_git_identity_before_mutation(
+    field, value, tmp_path, monkeypatch
+):
+    repo = _git_repo(tmp_path)
+    candidate = _app(tmp_path / "work" / "hq-stage")
+    provenance = _trusted_provenance(candidate, repo)
+    data = json.loads(provenance.read_text())
+    data[field] = value
+    provenance.write_text(json.dumps(data))
+    destination = tmp_path / "Applications" / "Black Label HQ.app"
+    _trust_external_tools(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        ship.install_candidate(
+            "hq", _cfg(repo), str(candidate), str(provenance),
+            str(destination), allow_applications=False,
+        )
+
+    assert not destination.exists()
 
 
 def test_installer_refuses_a_provenance_hash_mismatch_before_mutation(tmp_path, monkeypatch):
@@ -384,7 +526,10 @@ def test_staged_copy_gate_failure_does_not_touch_existing_destination(
 
     assert ship.sha256_tree(str(destination)) == old_hash
     receipt = json.loads(next(evidence.glob("*.json")).read_text())
-    assert receipt["rollback"]["outcome"] == "restored_absent"
+    assert receipt["rollback"] == {
+        "attempted": False,
+        "outcome": "destination_untouched",
+    }
 
 
 def test_post_install_gate_failure_rolls_back_the_previous_app_and_records_it(
@@ -425,6 +570,120 @@ def test_post_install_gate_failure_rolls_back_the_previous_app_and_records_it(
     receipt = json.loads(receipts[0].read_text())
     assert receipt["status"] == "rolled_back"
     assert receipt["rollback"]["outcome"] == "restored_backup"
+
+
+def test_keyboard_interrupt_after_exchange_restores_old_destination_and_records_it(
+    tmp_path, monkeypatch
+):
+    repo = _git_repo(tmp_path)
+    candidate = _app(tmp_path / "work" / "hq-stage")
+    provenance = _trusted_provenance(candidate, repo)
+    destination = tmp_path / "Applications" / "Black Label HQ.app"
+    old = _app(destination.parent, payload=b"old-installed")
+    old_hash = ship.sha256_tree(str(old))
+    evidence = tmp_path / "evidence" / "installs"
+    monkeypatch.setattr(ship, "INSTALL_EVIDENCE_DIR", str(evidence))
+    _trust_external_tools(monkeypatch)
+    real_verify = ship.verify_install_artifact
+    calls = {"count": 0}
+
+    def interrupt_installed(name, cfg, app_path, provenance_path):
+        calls["count"] += 1
+        if calls["count"] == 3:
+            raise KeyboardInterrupt()
+        return real_verify(name, cfg, app_path, provenance_path)
+
+    monkeypatch.setattr(ship, "verify_install_artifact", interrupt_installed)
+
+    with pytest.raises(KeyboardInterrupt):
+        ship.install_candidate(
+            "hq", _cfg(repo), str(candidate), str(provenance),
+            str(destination), allow_applications=False,
+        )
+
+    assert destination.exists()
+    assert ship.sha256_tree(str(destination)) == old_hash
+    receipt = json.loads(next(evidence.glob("*.json")).read_text())
+    assert receipt["status"] == "rolled_back"
+    assert receipt["rollback"]["outcome"] == "restored_backup"
+
+
+def test_interrupt_in_the_atomic_exchange_crash_window_restores_old_destination(
+    tmp_path, monkeypatch
+):
+    repo = _git_repo(tmp_path)
+    candidate = _app(tmp_path / "work" / "hq-stage")
+    provenance = _trusted_provenance(candidate, repo)
+    destination = tmp_path / "Applications" / "Black Label HQ.app"
+    old = _app(destination.parent, payload=b"old-installed")
+    old_hash = ship.sha256_tree(str(old))
+    evidence = tmp_path / "evidence" / "installs"
+    monkeypatch.setattr(ship, "INSTALL_EVIDENCE_DIR", str(evidence))
+    _trust_external_tools(monkeypatch)
+    real_exchange = ship.atomic_exchange_paths
+    calls = {"count": 0}
+
+    def interrupt_after_exchange(left, right):
+        calls["count"] += 1
+        real_exchange(left, right)
+        if calls["count"] == 1:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(ship, "atomic_exchange_paths", interrupt_after_exchange)
+
+    with pytest.raises(KeyboardInterrupt):
+        ship.install_candidate(
+            "hq", _cfg(repo), str(candidate), str(provenance),
+            str(destination), allow_applications=False,
+        )
+
+    assert destination.exists()
+    assert ship.sha256_tree(str(destination)) == old_hash
+    receipt = json.loads(next(evidence.glob("*.json")).read_text())
+    assert receipt["rollback"] == {
+        "attempted": True,
+        "outcome": "restored_backup",
+    }
+
+
+def test_production_replacement_refuses_when_atomic_exchange_is_unavailable(
+    tmp_path, monkeypatch
+):
+    destination = _app(tmp_path / "Applications", payload=b"old")
+    staged = _app(tmp_path / "stage", payload=b"new")
+    old_hash = ship.sha256_tree(str(destination))
+    monkeypatch.setattr(
+        ship,
+        "atomic_exchange_paths",
+        lambda _left, _right: (_ for _ in ()).throw(
+            ship.AtomicExchangeUnavailable("unsupported")
+        ),
+    )
+
+    with pytest.raises(SystemExit):
+        ship.replace_existing_destination(
+            str(staged), str(destination), str(tmp_path / "backup.app"),
+            allow_unsafe_test_fallback=False,
+        )
+
+    assert destination.exists()
+    assert ship.sha256_tree(str(destination)) == old_hash
+    assert staged.exists()
+
+
+def test_gatekeeper_requires_zero_exit_and_exact_accepted_assessment(monkeypatch):
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = "/tmp/HQ.app: accepted\n"
+
+    monkeypatch.setattr(ship, "_run", lambda _cmd: Result())
+    assert ship.gate_gatekeeper("/tmp/HQ.app") is not None
+    Result.returncode = 0
+    Result.stderr = "/tmp/HQ.app: not accepted\n"
+    assert ship.gate_gatekeeper("/tmp/HQ.app") is not None
+    Result.stderr = "/tmp/HQ.app: accepted\nsource=Notarized Developer ID\n"
+    assert ship.gate_gatekeeper("/tmp/HQ.app") is None
 
 
 def test_custom_installer_command_requires_destination_and_real_install_is_explicit(
