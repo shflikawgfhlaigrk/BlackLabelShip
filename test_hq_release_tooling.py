@@ -345,8 +345,51 @@ def test_installer_copies_verified_candidate_keeps_backup_and_writes_receipt(
     assert receipt["replacement"]["mode"] == "atomic_exchange"
     assert receipt["replacement"]["destination_continuously_present"] is True
     assert os.path.isdir(receipt["backup"]["path"])
-    assert receipt["backup"]["bundle_sha256"]
-    assert receipt["backup"]["exec_sha256"]
+    assert receipt["backup"]["bundle_sha256"] == ship.sha256_tree(
+        receipt["backup"]["path"]
+    )
+    assert receipt["backup"]["exec_sha256"] == ship.sha256_file(
+        ship._exec_path(receipt["backup"]["path"])
+    )
+    assert receipt["backup"]["bundle_sha256"] == receipt["pre_install_destination"]["bundle_sha256"]
+    assert receipt["backup"]["exec_sha256"] == receipt["pre_install_destination"]["exec_sha256"]
+
+
+def test_preimage_drift_during_atomic_exchange_is_swapped_back_and_never_succeeds(
+    tmp_path, monkeypatch
+):
+    repo = _git_repo(tmp_path)
+    candidate = _app(tmp_path / "work" / "hq-stage", payload=b"new-candidate")
+    provenance = _trusted_provenance(candidate, repo)
+    destination = tmp_path / "Applications" / "Black Label HQ.app"
+    _app(destination.parent, payload=b"old-prehash")
+    evidence = tmp_path / "evidence" / "installs"
+    monkeypatch.setattr(ship, "INSTALL_EVIDENCE_DIR", str(evidence))
+    _trust_external_tools(monkeypatch)
+    real_exchange = ship.atomic_exchange_paths
+    calls = {"count": 0}
+
+    def mutate_preimage_then_exchange(left, right):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            with open(ship._exec_path(right), "wb") as handle:
+                handle.write(b"concurrent-preimage-drift")
+        real_exchange(left, right)
+
+    monkeypatch.setattr(ship, "atomic_exchange_paths", mutate_preimage_then_exchange)
+
+    with pytest.raises(SystemExit):
+        ship.install_candidate(
+            "hq", _cfg(repo), str(candidate), str(provenance),
+            str(destination), allow_applications=False,
+        )
+
+    assert destination.exists()
+    assert open(ship._exec_path(str(destination)), "rb").read() == b"concurrent-preimage-drift"
+    receipts = [json.loads(path.read_text()) for path in evidence.glob("*.json")]
+    assert len(receipts) == 1
+    assert receipts[0]["status"] != "installed"
+    assert receipts[0]["rollback"]["outcome"] == "preimage_drift_restored"
 
 
 def test_installer_refuses_provenance_from_an_unrelated_repo_before_mutation(

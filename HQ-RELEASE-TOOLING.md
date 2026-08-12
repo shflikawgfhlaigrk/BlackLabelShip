@@ -44,8 +44,12 @@ same-filesystem staging directory and repeats the gates. Existing production
 installs are replaced with macOS `renameatx_np(RENAME_SWAP)`, so the live path
 is continuously populated across a crash or power loss; production refuses to
 replace when atomic exchange is unavailable. The previous app is retained as
-an explicit timestamped backup with pre-install bundle and executable hashes.
-Any caught post-exchange failure or interruption atomically restores it.
+an explicit timestamped backup. Immediately after exchange, Ship hashes that
+actual retained backup and requires its bundle and executable hashes to equal
+the pre-install destination hashes. Any drift atomically swaps the retained
+preimage back and fails the install. Later rollback is bound to the verified
+post-exchange backup hashes, not an earlier assumption. Any caught
+post-exchange failure or interruption atomically restores those exact bytes.
 Machine-readable receipts are written beneath `evidence/installs/`.
 
 The custom `--destination` lane may use a caught two-rename fallback on a

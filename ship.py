@@ -1333,13 +1333,27 @@ def _exec_hash_or_none(path):
         return None
 
 
+def _path_matches_bundle_identity(path, bundle_sha, exec_sha):
+    return (
+        _bundle_hash_or_none(path) == bundle_sha
+        and _exec_hash_or_none(path) == exec_sha
+    )
+
+
 def _restore_previous_destination(destination, sources, previous_bundle_sha,
-                                  allow_unsafe_test_fallback):
+                                  previous_exec_sha, allow_unsafe_test_fallback):
     """Restore the verified previous bundle without exposing an absent live path."""
-    if _bundle_hash_or_none(destination) == previous_bundle_sha:
+    if _path_matches_bundle_identity(
+        destination, previous_bundle_sha, previous_exec_sha
+    ):
         return "destination_untouched"
     source = next(
-        (path for path in sources if _bundle_hash_or_none(path) == previous_bundle_sha),
+        (
+            path for path in sources
+            if path and _path_matches_bundle_identity(
+                path, previous_bundle_sha, previous_exec_sha
+            )
+        ),
         None,
     )
     if source is None:
@@ -1362,7 +1376,9 @@ def _restore_previous_destination(destination, sources, previous_bundle_sha,
                 raise
     else:
         os.rename(source, destination)
-    if _bundle_hash_or_none(destination) != previous_bundle_sha:
+    if not _path_matches_bundle_identity(
+        destination, previous_bundle_sha, previous_exec_sha
+    ):
         raise RuntimeError("rollback restored bytes do not match pre-install destination")
     return "restored_backup"
 
@@ -1423,6 +1439,9 @@ def install_candidate(name, cfg, candidate_path, provenance_path, destination,
 
     staging_root = tempfile.mkdtemp(prefix=f".{name}-install-", dir=parent)
     staged_copy = os.path.join(staging_root, cfg["app_name"])
+    retained_backup_bundle_sha = None
+    retained_backup_exec_sha = None
+    preimage_drift_restored = False
     receipt = {
         "schema_version": 1,
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -1463,8 +1482,8 @@ def install_candidate(name, cfg, candidate_path, provenance_path, destination,
         "backup": {
             "path": backup,
             "kept": False,
-            "bundle_sha256": previous_bundle_sha,
-            "exec_sha256": previous_exec_sha,
+            "bundle_sha256": None,
+            "exec_sha256": None,
         },
         "replacement": {"mode": None, "destination_continuously_present": True},
         "installed": {"bundle_sha256": None, "exec_sha256": None},
@@ -1483,6 +1502,40 @@ def install_candidate(name, cfg, candidate_path, provenance_path, destination,
                 backup,
                 allow_unsafe_test_fallback=not allow_applications,
             )
+            # These are deliberately measured from the retained post-exchange
+            # backup, never copied from the earlier destination prehash. This
+            # closes the prehash→exchange TOCTOU window.
+            retained_backup_bundle_sha = _bundle_hash_or_none(backup)
+            retained_backup_exec_sha = _exec_hash_or_none(backup)
+            if not retained_backup_bundle_sha or not retained_backup_exec_sha:
+                fail(f"install: {name}: retained backup cannot be hashed after exchange")
+            receipt["backup"]["bundle_sha256"] = retained_backup_bundle_sha
+            receipt["backup"]["exec_sha256"] = retained_backup_exec_sha
+            if (
+                retained_backup_bundle_sha != previous_bundle_sha
+                or retained_backup_exec_sha != previous_exec_sha
+            ):
+                outcome = _restore_previous_destination(
+                    destination,
+                    [backup],
+                    retained_backup_bundle_sha,
+                    retained_backup_exec_sha,
+                    allow_unsafe_test_fallback=not allow_applications,
+                )
+                if outcome != "restored_backup":
+                    raise RuntimeError(
+                        f"preimage drift restore returned unexpected outcome {outcome}"
+                    )
+                preimage_drift_restored = True
+                receipt["rollback"] = {
+                    "attempted": True,
+                    "outcome": "preimage_drift_restored",
+                }
+                receipt["backup"]["kept"] = False
+                fail(
+                    f"install: {name}: destination changed between prehash and atomic "
+                    f"exchange; live preimage restored and install refused"
+                )
             receipt["backup"]["kept"] = True
         else:
             os.rename(staged_copy, destination)
@@ -1502,11 +1555,22 @@ def install_candidate(name, cfg, candidate_path, provenance_path, destination,
     except BaseException as exc:
         try:
             current_sha = _bundle_hash_or_none(destination)
-            if destination_existed:
+            if preimage_drift_restored:
+                receipt["rollback"] = {
+                    "attempted": True,
+                    "outcome": "preimage_drift_restored",
+                }
+                receipt["status"] = "rolled_back"
+                if backup and os.path.isdir(backup):
+                    shutil.rmtree(backup)
+            elif destination_existed:
+                rollback_bundle_sha = retained_backup_bundle_sha or previous_bundle_sha
+                rollback_exec_sha = retained_backup_exec_sha or previous_exec_sha
                 outcome = _restore_previous_destination(
                     destination,
                     [backup, staged_copy],
-                    previous_bundle_sha,
+                    rollback_bundle_sha,
+                    rollback_exec_sha,
                     allow_unsafe_test_fallback=not allow_applications,
                 )
                 receipt["rollback"] = {
@@ -1530,10 +1594,11 @@ def install_candidate(name, cfg, candidate_path, provenance_path, destination,
                         "attempted": False,
                         "outcome": "destination_untouched",
                     }
-            receipt["status"] = (
-                "rolled_back" if receipt["rollback"]["attempted"]
-                else "failed_pre_swap"
-            )
+            if not preimage_drift_restored:
+                receipt["status"] = (
+                    "rolled_back" if receipt["rollback"]["attempted"]
+                    else "failed_pre_swap"
+                )
         except BaseException as rollback_error:
             receipt["rollback"]["outcome"] = f"rollback_failed: {rollback_error}"
             receipt["rollback"]["attempted"] = True
