@@ -1094,6 +1094,17 @@ def stage_notarize(app_path, cfg, name):
     if r is None or r.returncode != 0:
         fail(f"notarize: staple failed: {(r.stdout or r.stderr).strip()[:200]}")
     print(f"  notarize: Accepted + stapled (id={sid})")
+    # Ship-truth COVERAGE gate: "Accepted" alone is not coverage. Fetch the
+    # submission LOG and assert the ticket actually covers the artifact —
+    # status Accepted, no blocking issues, every inner .app ticketed (for
+    # pkgs), stapler validate. Exit codes in tools/notarization-coverage-gate.py;
+    # any non-zero ABORTS the ship before upload.
+    g = _run([sys.executable, os.path.join(SHIP_ROOT, "tools", "notarization-coverage-gate.py"),
+              "--submission-id", sid, "--artifact", app_path])
+    if g.stdout:
+        print(g.stdout.rstrip())
+    if g.returncode != 0:
+        fail(f"notarize: coverage gate rc={g.returncode}: {(g.stderr or g.stdout).strip()[:300]}")
     return sid
 
 
@@ -1105,6 +1116,22 @@ def stage_upload(zip_path, cfg, name, build):
         if r.returncode != 0:
             fail(f"upload: wrangler put {k} failed: {(r.stderr or r.stdout).strip()[:300]}")
         print(f"  upload: r2 {R2_BUCKET}/{k} OK")
+    # Ship-truth MANIFEST (§5.1): re-sign the public /dl SHA256SUMS for the
+    # artifact just uploaded, so buyers can always verify their bytes:
+    #   minisign -Vm SHA256SUMS -p minisign.pub && shasum -a 256 -c SHA256SUMS
+    # tools/update-dl-manifest.py signs with the vault key
+    # (~/.utah/secrets/minisign/) and live-confirms the served manifest;
+    # failure ABORTS the ship (a stale signed manifest is a §5.1 violation).
+    h = hashlib.sha256()
+    with open(zip_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    m = _run([sys.executable, os.path.join(SHIP_ROOT, "tools", "update-dl-manifest.py"),
+              "--r2key", cfg["r2_dl_key"], "--sha", h.hexdigest()])
+    if m.stdout:
+        print(m.stdout.rstrip())
+    if m.returncode != 0:
+        fail(f"upload: dl-manifest update rc={m.returncode}: {(m.stderr or m.stdout).strip()[:300]}")
     return keys
 
 
