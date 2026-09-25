@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Black Label health check — pings the surfaces that must stay up and ALERTS Michael on
-any failure (Pushover via utah.alerts, mirrored to email on critical). Idempotent, logged,
-never raises. Registered as launchd com.blacklabel.healthcheck.
+"""Black Label health check — pings the surfaces that must stay up and opens one durable
+local incident when a Mac-owned check fails. Cloudflare owns public/API child incidents;
+this fallback pages only if its monitor becomes stale or a local check fails. Local OPEN,
+six-hour REMINDER, and RECOVERED transitions use high-priority Pushover without the
+emergency repeat-until-ack loop. Logged, never raises, and registered as launchd
+com.blacklabel.healthcheck.
 
 Checks: the Cloudflare public monitor is fresh and green, Stripe is reachable (read-only
 key fetch), the Utah daemon deck is alive, and the off-machine backup ran within the last
@@ -39,6 +42,12 @@ LOG = pathlib.Path.home() / ".utah" / "logs" / "healthcheck.log"
 BACKUP_LOG = pathlib.Path.home() / ".utah" / "logs" / "backup-offsite.log"
 DOCTOR = pathlib.Path.home() / "ProjectUtah" / "ops" / "automation_doctor.py"
 STATUS = pathlib.Path.home() / ".utah" / "run" / "automation_status.json"
+INCIDENT_STATE = pathlib.Path.home() / ".utah" / "run" / "healthcheck_incident.json"
+ALERT_REMINDER_SECONDS = 6 * 60 * 60
+CLOUD_OWNED_CHECKS = frozenset({
+    "public sites and cloud APIs",
+    "realestate onboarding smoke",
+})
 
 
 def _log(msg: str) -> None:
@@ -252,6 +261,110 @@ def _discord_feeds_ok(hooks_path: pathlib.Path | None = None,
     return True
 
 
+def _read_incident_state(path: pathlib.Path = INCIDENT_STATE) -> dict:
+    try:
+        state = json.loads(path.read_text())
+        return state if isinstance(state, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_incident_state(state: dict, path: pathlib.Path = INCIDENT_STATE) -> None:
+    """Persist the alert transition state atomically; a torn write must not reopen a storm."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    tmp.replace(path)
+
+
+def _local_failures(failed: list[str]) -> list[str]:
+    """Cloudflare owns its child incidents; this Mac owns local checks and cloud freshness."""
+    return [name for name in failed if name not in CLOUD_OWNED_CHECKS]
+
+
+def _parse_time(value) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def _sync_local_incident(
+    failed: list[str],
+    *,
+    now: dt.datetime | None = None,
+    state_path: pathlib.Path | None = None,
+) -> dict:
+    """Open/update/recover one durable local incident and return its delivery receipt."""
+    from utah import alerts
+
+    now = now or dt.datetime.now(dt.timezone.utc)
+    now_iso = now.isoformat()
+    path = state_path or INCIDENT_STATE
+    state = _read_incident_state(path)
+    signature = "|".join(sorted(failed))
+    prior_active = str(state.get("activeSignature") or "")
+    notified = str(state.get("notificationSignature") or "")
+    opened_at = str(state.get("openedAt") or "")
+    last_alert_at = _parse_time(state.get("lastAlertAt"))
+    reminder_due = bool(
+        signature
+        and signature == notified
+        and (
+            last_alert_at is None
+            or (now - last_alert_at).total_seconds() >= ALERT_REMINDER_SECONDS
+        )
+    )
+    action = "none"
+    delivery = {"sent": False, "gated": True, "reason": "not_needed"}
+
+    if signature:
+        if signature != prior_active:
+            opened_at = now_iso
+        if signature != notified or reminder_due:
+            if reminder_due:
+                action = "REMINDER"
+            else:
+                action = "OPEN" if not prior_active else "UPDATED"
+            detail = f"{action}: " + ", ".join(failed)
+            incident_id = opened_at.replace(":", "").replace("+", "")
+            if action == "REMINDER":
+                incident_id += f"-{int(now.timestamp() // ALERT_REMINDER_SECONDS)}"
+            delivery = alerts.ops(
+                "healthcheck",
+                detail,
+                key=f"healthcheck-{incident_id}",
+            )
+            if delivery.get("sent"):
+                notified = signature
+                state["lastAlertAt"] = now_iso
+    elif notified:
+        action = "RECOVERED"
+        detail = "RECOVERED: " + ", ".join(notified.split("|"))
+        incident_id = opened_at.replace(":", "").replace("+", "")
+        delivery = alerts.ops(
+            "healthcheck",
+            detail,
+            key=f"healthcheck-recovered-{incident_id}",
+        )
+        if delivery.get("sent"):
+            notified = ""
+            state["lastAlertAt"] = now_iso
+
+    state.update({
+        "version": 1,
+        "activeSignature": signature,
+        "notificationSignature": notified,
+        "openedAt": opened_at if signature or notified else None,
+        "updatedAt": now_iso,
+        "lastAction": action,
+        "lastDelivery": delivery,
+    })
+    _write_incident_state(state, path)
+    return {"action": action, "delivery": delivery, "state": state}
+
+
 def run(force_fail: bool = False) -> dict:
     checks: dict[str, bool] = {}
     cloud_ops = _cloud_ops_status()
@@ -272,20 +385,33 @@ def run(force_fail: bool = False) -> dict:
         checks["SYNTHETIC forced-fail (alert drill)"] = False
 
     failed = [name for name, ok in checks.items() if not ok]
+    local_failed = _local_failures(failed)
     summary = " | ".join(f"{n}={'OK' if ok else 'FAIL'}" for n, ok in checks.items())
     _log(f"healthcheck: {summary}")
 
-    if failed:
-        detail = "DOWN: " + ", ".join(failed)
-        try:
-            from utah import alerts
-            alerts.critical("healthcheck", detail, key="healthcheck-" + "-".join(sorted(failed)))
-            _log(f"ALERT sent to Michael: {detail}")
-        except Exception as exc:  # noqa: BLE001 — alert transport down: log it, never raise
-            _log(f"ALERT FAILED to send ({exc}): {detail}")
-    else:
+    notification = None
+    try:
+        notification = _sync_local_incident(local_failed)
+        action = notification["action"]
+        delivery = notification["delivery"]
+        if action != "none" and delivery.get("sent"):
+            _log(f"ALERT {action} sent: {', '.join(local_failed) or 'all local checks green'}")
+        elif action != "none":
+            reason = delivery.get("reason") or delivery.get("error") or "unknown"
+            _log(f"ALERT {action} not sent ({reason})")
+    except Exception as exc:  # noqa: BLE001 — alert transport/state failure never crashes checks
+        _log(f"ALERT FAILED to reconcile ({exc}): {', '.join(local_failed)}")
+
+    if failed and not local_failed:
+        _log("cloud incident observed; Cloudflare monitor owns notification: " + ", ".join(failed))
+    elif not failed:
         _log("all green")
-    return {"checks": checks, "failed": failed}
+    return {
+        "checks": checks,
+        "failed": failed,
+        "local_failed": local_failed,
+        "notification": notification,
+    }
 
 
 if __name__ == "__main__":

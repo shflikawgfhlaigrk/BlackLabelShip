@@ -1,0 +1,59 @@
+{
+  "app": "hq",
+  "backup": {
+    "bundle_sha256": "09b86a99e8a6d16168c3ea97a63cb04f0289bf6533d4ad5870a7997f88c90843",
+    "exec_sha256": "ec8a7888a402bca43c0b719861f9e6bae0b97efe48814c304111e7ac9bc8eb84",
+    "kept": true,
+    "path": "/Applications/Black Label HQ.app.backup-20260813T175624.398832Z"
+  },
+  "bundle": {
+    "build": "24",
+    "id": "com.blacklabel.hq",
+    "version": "1.0"
+  },
+  "candidate": {
+    "bundle_sha256": "f52cf46f0c1fd855d083285afc4eaca915eac95a0a68bfb066fbeb9c1184a5e2",
+    "exec_sha256": "34d9f8406383ad7e25562303f37d7c7dbf12cafe59a19c9c650f33d39c936b54",
+    "path": "/Users/michaelbarber/BlackLabelShip/work/hq-stage/Black Label HQ.app"
+  },
+  "destination": "/Applications/Black Label HQ.app",
+  "installed": {
+    "bundle_sha256": "f52cf46f0c1fd855d083285afc4eaca915eac95a0a68bfb066fbeb9c1184a5e2",
+    "exec_sha256": "34d9f8406383ad7e25562303f37d7c7dbf12cafe59a19c9c650f33d39c936b54"
+  },
+  "notary": {
+    "gatekeeper_accepted": true,
+    "stapled": true,
+    "submission_id": "dcedf019-b4c8-459d-a661-9cc6966093aa"
+  },
+  "pre_install_destination": {
+    "bundle_sha256": "09b86a99e8a6d16168c3ea97a63cb04f0289bf6533d4ad5870a7997f88c90843",
+    "exec_sha256": "ec8a7888a402bca43c0b719861f9e6bae0b97efe48814c304111e7ac9bc8eb84",
+    "present": true
+  },
+  "provenance": {
+    "finalized": "2026-08-13T17:55:48.829546+00:00",
+    "path": "/Users/michaelbarber/BlackLabelShip/work/hq-stage/provenance.json",
+    "sha256": "a263c5852ccf2b24606030ecd99b5cafabe32dca5e7521c47ece5be626edd2ca"
+  },
+  "replacement": {
+    "destination_continuously_present": true,
+    "mode": "atomic_exchange"
+  },
+  "rollback": {
+    "attempted": false,
+    "outcome": "not_required"
+  },
+  "schema_version": 1,
+  "signing": {
+    "developer_id": true,
+    "team_id": "745ZPGFRA5"
+  },
+  "source": {
+    "commit": "67a8a1e7868fe8d7e587c12223bf33b71fd62efe",
+    "repo": "/private/tmp/claude-501/-Users-michaelbarber-Desktop-Black-Label-B-ots-BlackLabel-Team-hq-completion-mobile-778721/89b46545-c88b-49c6-8d41-bfa5453ea3d5/scratchpad/hq-verify",
+    "tree": "df9b735e12e31a53891810e9122523f67b5df37a"
+  },
+  "status": "installed",
+  "timestamp": "2026-08-13T17:56:24.399153+00:00"
+}

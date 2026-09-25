@@ -1,0 +1,78 @@
+# Academy — WINDOWS lane (STAGED-ONLY, written 2026-08-12 on branch win-lane-20260812)
+# =============================================================================
+# Windows sibling of apps/academy.toml, modelled on apps/trading-windows.toml
+# (today's freshest green MSIX lane) and apps/realestate-windows.toml. Same
+# ship.py spine, separate fail-closed road (`ship.py --windows academy-windows`).
+#
+# HARD LAW (enforced in code): signing_identity == "UNSIGNED" => the road STOPS
+# at the signing gate. The artifact is staged to work/ with a -UNSIGNED-STAGED
+# suffix, sha256 recorded to ships-staged.jsonl, and it CANNOT reach the public
+# R2 /dl key or the live version manifest. Unsigned never ships.
+#
+# WHAT CI PRODUCES (Academy repo .github/workflows/windows-msix.yml,
+# "academy-windows-msix", windows-latest): the provenance-linted curriculum ->
+# SQLite -> static reader bundle, embedded in a Tauri v2/WebView2 shell
+# (windows/src-tauri, academy-win.exe), packed by makeappx into ONE UNSIGNED
+# Store MSIX at windows/dist/BlackLabelAcademy.msix — Partner Center upload
+# only; the Store re-signs at ingestion; Windows refuses to sideload unsigned
+# MSIX. While the three WINDOWS_MSIX_* identity values are unset (repo secrets
+# or windows/partner-center-identity.env — NOTE: Academy predates Trading's
+# PARTNER_CENTER_* variable naming, cosmetic divergence only) the manifest
+# carries the inert __PARTNER_CENTER_PENDING__ sentinel and the run's VERDICT
+# is PACKED-NOT-SUBMITTABLE (lane proof, not a submission).
+#
+# The Windows lane READS the pinned offer copy (14-day free trial, $30/month —
+# ruling 2026-08-04) from tools/academy/reader.py; tests/test_reader.py fails
+# any build that drifts it. No checkout/paywall code rides in this package —
+# the reader payload is verifiably checkout-free (tests/test_reader.py:96-98).
+#
+# distribution stays "selfdist" like trading-windows/circuit-windows so the
+# UNSIGNED signing gate is the terminus — the company staging pattern of record
+# (ships-staged.jsonl, -UNSIGNED-STAGED). Flip to "store" when the founder
+# registers Partner Center (apps/PARTNER_CENTER_READY marker) AND sets the
+# three identity values; the VERDICT flips to PACKED-SUBMITTABLE in the same
+# run that sees them.
+# =============================================================================
+
+platform = "windows"
+repo = "~/BlackLabelAcademy"
+bundle_id = "com.blacklabel.academy"
+app_name = "BlackLabelAcademy.msix"
+
+# --- build: ci-pull only (rig is Founder-blocked — no hypervisor) -----------
+build_mode_default = "ci-pull"
+# Verified 2026-08-12 against the real repo: green windows-msix.yml run on
+# branch win-lane-20260812 publishes artifact `academy-store-msix-UNSIGNED-
+# PACKED`; the artifact root is the repo root, so the .msix sits at
+# windows/dist/ inside it (+ msix-VERDICT.txt / msix-evidence.txt /
+# msix-pack.log / cargo-build.log / runner-evidence.txt sidecars).
+build_cmd_ci = "gh run download {run} --repo shflikawgfhlaigrk/BlackLabelAcademy --name academy-store-msix-UNSIGNED-PACKED --dir {out}"
+ci_workflow = "windows-msix.yml"
+ci_artifact_name = "academy-store-msix-UNSIGNED-PACKED"
+
+# where the pulled .msix lands inside the downloaded artifact dir
+built_artifact_windows = "windows/dist/BlackLabelAcademy.msix"
+
+# --- distribution: selfdist => the UNSIGNED gate is the staged terminus -----
+distribution = "selfdist"
+
+# --- signing (FOUNDER GATE — money). UNSIGNED => STAGED-ONLY hard stop. ------
+signing_identity = "UNSIGNED"
+sign_cmd = "signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /sha1 {thumbprint} {artifact}"
+
+# --- gauntlet steps (documented; ci-pull mode SKIPS-WITH-REASON, no rig) -----
+defender_scan_cmd = "powershell -Command \"Start-MpScan -ScanType CustomScan -ScanPath {artifact}\""
+clean_buyer_gauntlet_cmd = "prlctl snapshot-switch 'Windows 11' --name clean-buyer  # BLOCKED ON RIG"
+
+# --- publish targets (NEVER written while signing_identity == UNSIGNED) ------
+# Academy is a Black Label suite product with no standalone domain; its ship
+# surface of record is blacklabelbots.com (apps/academy.toml dl_url), so the
+# Windows dl URL stays same-domain with the existing Academy pattern.
+r2_dl_key_windows = "dl/academy-windows.msix"
+r2_updates_key_windows = "updates/academy-windows/{build}.msix"
+manifest_endpoint_windows = "/api/version/academy-windows"
+dl_url_windows = "https://blacklabelbots.com/dl/academy-windows.msix"
+
+# The Academy shell embeds its reader bundle and binds NO local port — no
+# server, no network of its own — so ports is intentionally empty.
+ports = []

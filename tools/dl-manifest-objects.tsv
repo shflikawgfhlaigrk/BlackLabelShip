@@ -1,7 +1,7 @@
 BlackLabel-Family.pkg	BlackLabel-Family.pkg
 sovereign.zip	Black-Label-Sovereign-2026-07-01-Ornith.zip
-homefront.zip	Black-Label-Homefront.zip
-homefront.zip	Black-Label-Vigil.zip
+updates/homefront/16.zip	Black-Label-Homefront.zip
+updates/homefront/16.zip	Black-Label-Vigil.zip
 marketing.zip	Black-Label-Marketing.zip
 realestate.zip	Black-Label-RealEstate.zip
 academy.zip	Black-Label-Academy.zip
@@ -12,10 +12,6 @@ hq.zip	Black-Label-HQ.zip
 releases/ace-1.14-build21.zip	Ace.zip
 releases/ace-1.14-build21.dmg	Ace.dmg
 trading.dmg	Black-Label-Trading.dmg
-academy.dmg	Black-Label-Academy.dmg
-marketing.dmg	Black-Label-Marketing.dmg
-realestate.dmg	Black-Label-RealEstate.dmg
-sunset.dmg	Sunset.dmg
-homefront.dmg	Vigil.dmg
-sovereign.dmg	Sovereign.dmg
+releases/homefront/16/Vigil-build16-f170318c.dmg	Vigil.dmg
 Black-Label-Suite.pkg	Black-Label-Suite.pkg
+termial.zip	Termial.zip

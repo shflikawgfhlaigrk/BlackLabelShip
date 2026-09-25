@@ -1,0 +1,29 @@
+# Homefront Guardian (BL Vigil companion) — iOS App Store lane (STAGED-ONLY, fail-closed).
+# Read by apps/ios-lane/ios_lane.py (NOT ship.py — this is the iOS road, platform="ios").
+# The RELEASE-Xcode IPA is produced by .github/workflows/ios-release.yml in the
+# HomefrontGuardian repo on hosted macos-15 (release Xcode 26.3 / 17C529), clearing
+# the beta 26.6/17F113 host stamp. This config only tells the LOCAL road how to
+# PULL that artifact and stage it fail-closed.
+#
+# signing_identity = "UNSIGNED" -> ios_lane STAGES ONLY: copies the pulled IPA to
+# work/homefront-ios-UNSIGNED-STAGED-ONLY.ipa, shas it, appends ONE line to
+# ships-staged.jsonl. NOTHING uploads; ships.jsonl is NOT written. (The pulled IPA
+# itself IS distribution-signed by CI — the name marks the fail-closed local
+# terminus, not the IPA's signature state.) ASC transport is the CI lane's
+# workflow_dispatch double owner gate (IOS_SIGNING_READY + IOS_CONFIRM_UPLOAD),
+# Michael-only per §3. Build 14 (v1.1) is already uploaded + ASC processingState=VALID
+# (run 31471424478, 2026-08-11).
+# NOTE: the CI artifact name tracks repo var IOS_SIGNING_READY — currently true ->
+# "homefrontguardian-ios-SIGNED-upload-ready"; if the owner unsets it the lane
+# publishes "homefrontguardian-ios-UNSIGNED-STAGED-ONLY" and this file must follow.
+platform = "ios"
+repo = "~/HomefrontGuardian"
+bundle_id = "com.blacklabel.homefront.guardian"
+app_name = "HomefrontGuardian"
+ci_workflow = "ios-release.yml"
+build_cmd_ci = "gh run download {run} --repo shflikawgfhlaigrk/HomefrontGuardian --name homefrontguardian-ios-SIGNED-upload-ready --dir {out}"
+ci_artifact_name = "homefrontguardian-ios-SIGNED-upload-ready"
+built_artifact_ios = "export/Vigil.ipa"
+signing_identity = "UNSIGNED"
+export_plist = "apps/ios-lane/ExportOptions-AppStore-iOS.plist"
+asc_app_id = "6783041003"

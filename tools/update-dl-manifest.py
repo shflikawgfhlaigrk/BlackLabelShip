@@ -189,7 +189,15 @@ def main():
                    f"/dl ALLOWED map before shipping a new artifact")
         if not (len(a.sha) == 64 and all(c in "0123456789abcdef" for c in a.sha.lower())):
             die(2, "--sha must be a hex sha256")
-        lines = fetch_current_lines()
+        # The TSV is the active delivery allow-list. Prune filenames removed
+        # from it so an incremental ship cannot keep advertising a stale,
+        # disabled artifact forever.
+        allowed_filenames = {fname for fnames in mapping.values() for fname in fnames}
+        lines = {
+            fname: sha
+            for fname, sha in fetch_current_lines().items()
+            if fname in allowed_filenames
+        }
         for fn in mapping[a.r2key]:
             lines[fn] = a.sha.lower()
     else:

@@ -1,0 +1,60 @@
+# Trading — WINDOWS lane (STAGED-ONLY, written 2026-08-12 on branch win-lane-20260812)
+# =============================================================================
+# Windows sibling of apps/trading.toml, modelled on apps/circuit-windows.toml.
+# Same ship.py spine, separate fail-closed road (`ship.py --windows trading-windows`).
+#
+# HARD LAW (enforced in code): signing_identity == "UNSIGNED" => the road STOPS
+# at the signing gate. The artifact is staged to work/ with a -UNSIGNED-STAGED
+# suffix, sha256 recorded to ships-staged.jsonl, and it CANNOT reach the public
+# R2 /dl key or the live version manifest. Unsigned never ships.
+#
+# WHAT CI PRODUCES (Trading repo .github/workflows/windows-msix.yml, "Trading
+# Windows MSIX"): a Store-first UNSIGNED .msix for Partner Center upload only —
+# the Store re-signs at ingestion; sideload is impossible by design, and
+# sign-windows.ps1 exits 2 until a cert exists. While the three
+# PARTNER_CENTER_* repo variables are unset the package carries placeholder
+# identity and is named -PLACEHOLDER-IDENTITY-NOT-SUBMITTABLE (lane proof, not
+# a submission). First green lane-proof run: 31646814509 (2026-08-12,
+# branch win-lane-20260812, verdict PACKED-PLACEHOLDER-IDENTITY).
+#
+# distribution stays "selfdist" like circuit-windows so the UNSIGNED signing
+# gate is the terminus — that is the company staging pattern of record
+# (ships-staged.jsonl, -UNSIGNED-STAGED). Flip to "store" when the founder
+# registers Partner Center (apps/PARTNER_CENTER_READY marker) AND sets the
+# three PARTNER_CENTER_* repo variables; CI then emits BlackLabelTrading.msix
+# with real identity — update built_artifact_windows in the same change.
+# =============================================================================
+
+platform = "windows"
+repo = "~/BlackLabelTrading"
+bundle_id = "com.blacklabel.trading"
+app_name = "BlackLabelTrading.msix"
+
+# --- build: ci-pull only (rig is Founder-blocked — no hypervisor) -----------
+build_mode_default = "ci-pull"
+# Verified 2026-08-12 against the real repo: green windows-msix.yml run
+# 31646814509 publishes artifact `trading-store-msix-UNSIGNED-PACKED`; the
+# artifact root is the repo root, so the .msix sits at windows/dist/ inside it.
+build_cmd_ci = "gh run download {run} --repo shflikawgfhlaigrk/BlackLabelTrading --name trading-store-msix-UNSIGNED-PACKED --dir {out}"
+ci_workflow = "windows-msix.yml"
+ci_artifact_name = "trading-store-msix-UNSIGNED-PACKED"
+
+# where the pulled .msix lands inside the downloaded artifact dir
+built_artifact_windows = "windows/dist/BlackLabelTrading-PLACEHOLDER-IDENTITY-NOT-SUBMITTABLE.msix"
+
+# --- distribution: selfdist => the UNSIGNED gate is the staged terminus -----
+distribution = "selfdist"
+
+# --- signing (FOUNDER GATE — money). UNSIGNED => STAGED-ONLY hard stop. ------
+signing_identity = "UNSIGNED"
+sign_cmd = "signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /sha1 {thumbprint} {artifact}"
+
+# --- gauntlet steps (documented; ci-pull mode SKIPS-WITH-REASON, no rig) -----
+defender_scan_cmd = "powershell -Command \"Start-MpScan -ScanType CustomScan -ScanPath {artifact}\""
+clean_buyer_gauntlet_cmd = "prlctl snapshot-switch 'Windows 11' --name clean-buyer  # BLOCKED ON RIG"
+
+# --- publish targets (NEVER written while signing_identity == UNSIGNED) ------
+r2_dl_key_windows = "dl/trading-windows.msix"
+r2_updates_key_windows = "updates/trading-windows/{build}.msix"
+manifest_endpoint_windows = "/api/version/trading-windows"
+dl_url_windows = "https://blacklabelbots.com/dl/trading-windows.msix"

@@ -1,0 +1,72 @@
+# Real Estate — WINDOWS lane (STAGED-ONLY, written 2026-08-12 on branch win-lane-20260812)
+# =============================================================================
+# Windows sibling of apps/realestate.toml, modelled on apps/trading-windows.toml
+# (the freshest green Windows lane) and apps/circuit-windows.toml. Same ship.py
+# spine, separate fail-closed road (`ship.py --windows realestate-windows`).
+# Source draft lives with the app: ~/BlackLabelRealEstate/windows/ship/.
+#
+# HARD LAW (enforced in code): signing_identity == "UNSIGNED" => the road STOPS
+# at the signing gate. The artifact is staged to work/ with a -UNSIGNED-STAGED
+# suffix, sha256 recorded to ships-staged.jsonl, and it CANNOT reach the public
+# R2 /dl key or the live version manifest. Unsigned never ships.
+#
+# WHAT CI PRODUCES (RealEstate repo .github/workflows/windows-build.yml,
+# "realestate-windows", windows-latest): `cargo tauri build --bundles nsis` over
+# the thin Tauri v2 WebView shell (windows/src-tauri) wrapping the zero-build
+# static UI (windows/ui -> live worker https://api.blbestate.com). The NSIS
+# setup exe is copied to the contract name realestate-windows-UNSIGNED-STAGED-
+# ONLY.exe at the artifact root and uploaded as artifact
+# realestate-windows-UNSIGNED-STAGED-ONLY (+ sha256 + build-log sidecars).
+# The SAME job also packs the Store MSIX (placeholder identity until the three
+# PARTNER_CENTER_* repo secrets exist) as a separate artifact — Partner Center
+# upload only; Windows refuses to sideload unsigned MSIX.
+#
+# distribution stays "selfdist" like trading-windows/circuit-windows so the
+# UNSIGNED signing gate is the terminus — the company staging pattern of record
+# (ships-staged.jsonl, -UNSIGNED-STAGED). Flip to "store" when the founder
+# registers Partner Center (apps/PARTNER_CENTER_READY marker) AND sets the
+# three PARTNER_CENTER_* repo secrets; point built_artifact_windows at the
+# packed .msix in the same change.
+# =============================================================================
+
+platform = "windows"
+repo = "~/BlackLabelRealEstate"
+bundle_id = "com.blacklabel.realestate"
+app_name = "BlackLabelRealEstate-Setup.exe"
+
+# --- build: ci-pull only (rig is Founder-blocked — no hypervisor) -----------
+build_mode_default = "ci-pull"
+# Verified 2026-08-12 against the real repo: green windows-build.yml run on
+# branch win-lane-20260812 publishes artifact `realestate-windows-UNSIGNED-
+# STAGED-ONLY` containing `realestate-windows-UNSIGNED-STAGED-ONLY.exe` at the
+# artifact root (+ windows-artifacts-sha256.txt + tauri-build.log sidecars).
+build_cmd_ci = "gh run download {run} --repo shflikawgfhlaigrk/BlackLabelRealEstate --name realestate-windows-UNSIGNED-STAGED-ONLY --dir {out}"
+ci_workflow = "windows-build.yml"
+ci_artifact_name = "realestate-windows-UNSIGNED-STAGED-ONLY"
+
+# where the pulled installer lands inside the downloaded artifact dir
+built_artifact_windows = "realestate-windows-UNSIGNED-STAGED-ONLY.exe"
+
+# --- distribution: selfdist => the UNSIGNED gate is the staged terminus -----
+distribution = "selfdist"
+
+# --- signing (FOUNDER GATE — money). UNSIGNED => STAGED-ONLY hard stop. ------
+signing_identity = "UNSIGNED"
+sign_cmd = "signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /sha1 {thumbprint} {artifact}"
+
+# --- gauntlet steps (documented; ci-pull mode SKIPS-WITH-REASON, no rig) -----
+defender_scan_cmd = "powershell -Command \"Start-MpScan -ScanType CustomScan -ScanPath {artifact}\""
+clean_buyer_gauntlet_cmd = "prlctl snapshot-switch 'Windows 11' --name clean-buyer  # BLOCKED ON RIG"
+
+# --- publish targets (NEVER written while signing_identity == UNSIGNED) ------
+# BRAND ISOLATION (founder rule): RealEstate is its own standalone brand
+# (blbestate.com). Buyer-facing download URL is SAME-DOMAIN, never a
+# cross-brand company-suite path.
+r2_dl_key_windows = "dl/realestate-windows.exe"
+r2_updates_key_windows = "updates/realestate-windows/{build}.exe"
+manifest_endpoint_windows = "/api/version/realestate-windows"
+dl_url_windows = "https://blbestate.com/dl/realestate-windows.exe"
+
+# RealEstate's Windows shell binds NO local port — the engine is the remote
+# worker (https://api.blbestate.com) — so ports is intentionally empty.
+ports = []
