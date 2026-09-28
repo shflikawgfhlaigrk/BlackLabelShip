@@ -8,6 +8,7 @@ matched to its source. Restores are staged privately and published atomically.
 """
 import argparse
 import contextlib
+import ctypes
 import datetime as dt
 import fcntl
 import hashlib
@@ -572,6 +573,31 @@ def load_manifest(store, crypto, work, prefix=None):
         cipher.unlink(missing_ok=True)
 
 
+def publish_restored_directory(stage, destination):
+    """Atomically publish a restore without replacing a concurrent destination."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes, destination_bytes = os.fsencode(stage), os.fsencode(destination)
+    if sys.platform == "darwin":
+        # renamex_np with RENAME_EXCL refuses an existing path or symlink.
+        operation = getattr(libc, "renamex_np", None)
+        if operation is None:
+            raise BackupError("Atomic no-overwrite directory publication is unavailable")
+        operation.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        result = operation(source_bytes, destination_bytes, 4)
+    elif sys.platform.startswith("linux"):
+        # renameat2 with RENAME_NOREPLACE closes the check/publish race.
+        operation = getattr(libc, "renameat2", None)
+        if operation is None:
+            raise BackupError("Atomic no-overwrite directory publication is unavailable")
+        operation.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                              ctypes.c_char_p, ctypes.c_uint)
+        result = operation(-100, source_bytes, -100, destination_bytes, 1)
+    else:
+        raise BackupError("Atomic no-overwrite directory publication is unavailable")
+    if result != 0:
+        raise OSError(ctypes.get_errno(), "Atomic no-overwrite restore publication failed")
+
+
 def verify(store, crypto, work, prefix=None, destination=None):
     manifest = load_manifest(store, crypto, work, prefix)
     destination = Path(destination).absolute() if destination is not None else None
@@ -605,14 +631,7 @@ def verify(store, crypto, work, prefix=None, destination=None):
             sums = "".join(f"{f['sha256']}  ./{f['name']}\n" for f in files)
             (stage / ("SHA256SUMS." + manifest["stamp"])).write_text(sums)
             save_json(stage / "ENCRYPTED-RESTORE-RECEIPT.json", report)
-            # renamex_np(RENAME_EXCL) makes the final publication no-clobber on macOS.
-            if sys.platform == "darwin":
-                import ctypes
-                libc = ctypes.CDLL(None, use_errno=True)
-                if libc.renamex_np(os.fsencode(stage), os.fsencode(destination), 4) != 0:
-                    raise OSError(ctypes.get_errno(), "Atomic no-overwrite restore publication failed")
-            else:
-                raise BackupError("Atomic no-overwrite directory restore currently requires macOS")
+            publish_restored_directory(stage, destination)
         return report
     finally:
         if stage.exists():

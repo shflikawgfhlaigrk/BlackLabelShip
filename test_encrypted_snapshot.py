@@ -186,6 +186,21 @@ class BackupTests(unittest.TestCase):
             backup.verify(self.store, self.crypto, self.work, self.prefix, destination)
         self.assertEqual((destination / "user-work").read_text(), "preserve this")
 
+    def test_destination_created_during_restore_is_preserved(self):
+        destination = self.root / "restored"
+        original_save_json = backup.save_json
+
+        def create_concurrent_destination(path, value):
+            original_save_json(path, value)
+            destination.mkdir()
+            (destination / "user-work").write_text("concurrent work")
+
+        with patch.object(backup, "save_json", side_effect=create_concurrent_destination), \
+             self.assertRaises(OSError):
+            backup.verify(self.store, self.crypto, self.work, self.prefix, destination)
+        self.assertEqual((destination / "user-work").read_text(), "concurrent work")
+        self.assertFalse(list(self.root.glob(".encrypted-restore-*")))
+
     def test_dangling_symlink_destination_rejected(self):
         destination = self.root / "restored"
         destination.symlink_to(self.root / "absent", target_is_directory=True)
