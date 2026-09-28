@@ -1,6 +1,7 @@
 """Real GPG, offline object-store and failure-injection backup regressions."""
 import copy
 import contextlib
+from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import io
@@ -311,6 +312,12 @@ class BackupTests(unittest.TestCase):
                                capture_output=True, text=True, timeout=20)
         self.assertNotEqual(wrong.returncode, 0)
         self.assertFalse((self.root / "state/last-upload.json").exists())
+        directory_only = dict(env)
+        directory_only.pop("SNAPSHOT_MANIFEST")
+        incomplete = subprocess.run(["/bin/bash", str(script)], env=directory_only,
+                                    capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(incomplete.returncode, 0)
+        self.assertIn("must be supplied together", incomplete.stdout)
         env["SNAPSHOT_MANIFEST"] = "SHA256SUMS." + STAMP
         correct = subprocess.run(["/bin/bash", str(script)], env=env,
                                  capture_output=True, text=True, timeout=60)
@@ -319,6 +326,46 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "passed")
         self.assertEqual(receipt["operation"], "upload")
         self.assertTrue(receipt["latest_published"])
+
+    def test_scheduled_wrapper_requires_fresh_completed_attempt(self):
+        script = Path(__file__).parent / "backup_offsite_snapshot.sh"
+        root = self.root / "scheduled-backups"
+        root.mkdir()
+        env = dict(os.environ, BACKUP_PYTHON=sys.executable, BACKUPS_ROOT=str(root),
+                   BACKUP_KEYFILE=str(self.key),
+                   BACKUP_LOCAL_TEST_STORE=str(self.root / "scheduled-store"),
+                   SNAP_STATE_DIR=str(self.root / "scheduled-state"),
+                   OFFSITE_LOG=str(self.root / "scheduled.log"),
+                   SNAP_CHUNK_BYTES="4096", SNAP_WAIT_SECS="0", SNAP_POLL_SECS="1")
+        missing = subprocess.run(["/bin/bash", str(script)], env=env,
+                                 capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertFalse((self.root / "scheduled-state/last-upload.json").exists())
+
+        started = datetime.now(timezone.utc).replace(microsecond=0)
+        stamp = started.strftime("%Y%m%dT%H%M%SZ")
+        directory = root / started.strftime("%Y-%m-%d")
+        directory.mkdir()
+        sums = []
+        for old_name, data in self.payloads.items():
+            name = old_name.replace(STAMP, stamp)
+            (directory / name).write_bytes(data)
+            sums.append(hashlib.sha256(data).hexdigest() + "  ./" + name + "\n")
+        manifest = directory / ("SHA256SUMS." + stamp)
+        manifest.write_text("".join(sums))
+        attempt_id = stamp + "-123"
+        (directory / ("ATTEMPT." + attempt_id + ".json")).write_text(json.dumps({
+            "schema": "blacklabel.backup-attempt.v1", "attempt_id": attempt_id,
+            "started_at": started.isoformat(), "status": "complete", "exit_code": 0,
+            "snapshot_stamp": stamp, "snapshot_dir": str(directory),
+            "snapshot_complete": True, "checksum_manifest": str(manifest),
+        }))
+        complete = subprocess.run(["/bin/bash", str(script)], env=env,
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(complete.returncode, 0, complete.stdout + complete.stderr)
+        receipt = json.loads((self.root / "scheduled-state/last-upload.json").read_text())
+        self.assertEqual(receipt["status"], "passed")
+        self.assertEqual(receipt["operation"], "upload")
 
     def test_bad_source_checksum_does_not_publish(self):
         wrong = copy.deepcopy(self.snapshot)
