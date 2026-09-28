@@ -30,6 +30,12 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Install zsh for the production wrapper test
+        run: |
+          if ! command -v zsh >/dev/null; then
+            sudo -n apt-get update -qq
+            sudo -n apt-get install -y --no-install-recommends zsh
+          fi
       - name: Check recovery tools and shell syntax
         run: |
           command -v python3
