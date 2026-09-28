@@ -4,6 +4,8 @@ The scheduled local producer is `~/BlackLabel-Team/bin/backup.sh`. A complete se
 
 `backup_offsite.sh` uploads the small encrypted state bundle, then calls `backup_offsite_snapshot.sh` for the complete three-artifact set. The aggregate job exits unsuccessfully if the full snapshot lane fails. `backup_offsite_snapshot.sh` selects the newest dated local snapshot only after `encrypted_snapshot.py inspect` accepts its exact manifest.
 
+For an event-driven or manual upload of a particular completed set, pass `SNAPSHOT_DIR` and `SNAPSHOT_MANIFEST` to `backup_offsite_snapshot.sh`. This binds the producer's checksum sentinel to the offsite upload even when another snapshot is being written in the same dated directory. A scheduler should pass these two values from a successful local completion receipt, instead of relying on a time offset. The wrapper requires an upload receipt with `status: passed`, `operation: upload`, and `latest_published: true` before reporting offsite completion.
+
 ## Upload contract
 
 - Full-set objects are encrypted before upload to `r2://blacklabel-backups/encrypted-v1/`.

@@ -474,7 +474,15 @@ def upload(snapshot, store, crypto, work, journal, chunk_bytes=CHUNK_BYTES,
         if not re.fullmatch(PREFIX, prefix):
             raise BackupError("Unsafe resume prefix")
         if state.get("status") == "complete":
-            return verify(store, crypto, work, prefix)
+            if state.get("latest_published") != publish_latest:
+                raise BackupError("Completed upload latest-pointer policy changed")
+            report = verify(store, crypto, work, prefix)
+            if report["files"] != state.get("files"):
+                raise BackupError("Completed upload journal and remote files differ")
+            if publish_latest and load_manifest(store, crypto, work)["prefix"] != prefix:
+                raise BackupError("Completed upload is not the remote latest snapshot")
+            return {**report, "operation": "upload", "latest_published": publish_latest,
+                    "reverified": True}
         files = []
         cipher = Path(work) / "upload.gpg"
         try:

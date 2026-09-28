@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -284,6 +285,40 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(result["prefix"], first["prefix"])
         self.assertEqual(result["status"], "passed")
         self.assertEqual(backup.verify(self.store, self.crypto, self.work)["status"], "passed")
+
+    def test_completed_upload_reverifies_before_reporting_success(self):
+        first = self.upload_new()
+        second = self.upload_new()
+        self.assertEqual(second["prefix"], first["prefix"])
+        self.assertEqual(second["operation"], "upload")
+        self.assertTrue(second["latest_published"])
+        self.assertTrue(second["reverified"])
+        self.store.path("encrypted-v1/LATEST.gpg").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.upload_new()
+
+    def test_offsite_wrapper_binds_explicit_snapshot_manifest(self):
+        script = Path(__file__).parent / "backup_offsite_snapshot.sh"
+        env = dict(os.environ, BACKUP_PYTHON=sys.executable,
+                   SNAPSHOT_DIR=str(self.source),
+                   SNAPSHOT_MANIFEST="SHA256SUMS.20260911T000000Z",
+                   BACKUP_KEYFILE=str(self.key),
+                   BACKUP_LOCAL_TEST_STORE=str(self.root / "offline"),
+                   SNAP_STATE_DIR=str(self.root / "state"),
+                   OFFSITE_LOG=str(self.root / "offsite.log"),
+                   SNAP_CHUNK_BYTES="4096", SNAP_WAIT_SECS="0", SNAP_POLL_SECS="1")
+        wrong = subprocess.run(["/bin/bash", str(script)], env=env,
+                               capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(wrong.returncode, 0)
+        self.assertFalse((self.root / "state/last-upload.json").exists())
+        env["SNAPSHOT_MANIFEST"] = "SHA256SUMS." + STAMP
+        correct = subprocess.run(["/bin/bash", str(script)], env=env,
+                                 capture_output=True, text=True, timeout=60)
+        self.assertEqual(correct.returncode, 0, correct.stdout + correct.stderr)
+        receipt = json.loads((self.root / "state/last-upload.json").read_text())
+        self.assertEqual(receipt["status"], "passed")
+        self.assertEqual(receipt["operation"], "upload")
+        self.assertTrue(receipt["latest_published"])
 
     def test_bad_source_checksum_does_not_publish(self):
         wrong = copy.deepcopy(self.snapshot)
