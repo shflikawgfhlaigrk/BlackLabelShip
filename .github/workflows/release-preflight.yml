@@ -1,0 +1,21 @@
+name: Release preflight tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  provenance:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check release script syntax and provenance gates
+        run: |
+          python3 -m py_compile ship.py test_repo_root.py test_windows_lane.py test_redaction.py
+          python3 -m unittest test_repo_root.py test_windows_lane.py test_redaction.py -q

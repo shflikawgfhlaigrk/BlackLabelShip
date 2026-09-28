@@ -262,6 +262,15 @@ def _run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
+def assert_exact_git_root(path, label):
+    """Reject a plain directory that inherits Git state from a parent repo."""
+    result = _run(["git", "-C", path, "rev-parse", "--show-toplevel"])
+    actual = result.stdout.strip()
+    expected = os.path.realpath(path)
+    if result.returncode != 0 or not actual or os.path.realpath(actual) != expected:
+        fail(f"{label}: expected an independent Git root at {path}; found {actual or 'none'}")
+
+
 def gate_gatekeeper(app_path, cfg=None):
     r = _run(["spctl", "-a", "-vv", "-t", "install", app_path])
     ok = "accepted" in (r.stderr + r.stdout)
@@ -503,11 +512,16 @@ def stage_preflight(cfg, name):
         fail(f"HOLD: shipping {name} is Founder-blocked — {why or 'see HOLD file'} "
              f"(remove {hold} only on Founder's word)")
     repo = expand(cfg["repo"])
+    assert_exact_git_root(repo, f"preflight: {name}")
     r = _run(["git", "-C", repo, "status", "--porcelain"])
+    if r.returncode != 0:
+        fail(f"preflight: {name}: git status failed")
     dirty = [l for l in r.stdout.splitlines() if l.strip()]
     if dirty:
         fail(f"preflight: {name}: working tree dirty ({len(dirty)} entries) — commit first (provenance)")
     head = _run(["git", "-C", repo, "rev-parse", "--short", "HEAD"]).stdout.strip()
+    if not head:
+        fail(f"preflight: {name}: no source commit")
     print(f"  preflight: tree clean at {head}")
     if cfg.get("test_cmd"):
         print(f"  preflight: tests: {redact(cfg['test_cmd'])}")
@@ -720,10 +734,18 @@ def win_preflight(cfg, name):
             why = f.read().strip()
         fail(f"HOLD: shipping {name} is Founder-blocked — {why or 'see HOLD file'}")
     repo = expand(cfg["repo"])
+    assert_exact_git_root(repo, f"win-preflight: {name}")
     r = _run(["git", "-C", repo, "status", "--porcelain"])
+    if r.returncode != 0:
+        fail(f"win-preflight: {name}: git status failed")
+    dirty = [l for l in r.stdout.splitlines() if l.strip()]
+    if dirty:
+        fail(f"win-preflight: {name}: working tree dirty ({len(dirty)} entries)")
     head = _run(["git", "-C", repo, "rev-parse", "--short", "HEAD"]).stdout.strip()
-    print(f"  win-preflight: repo {repo} @ {head or '?'}")
-    return head or "unknown"
+    if not head:
+        fail(f"win-preflight: {name}: no source commit")
+    print(f"  win-preflight: repo {repo} @ {head}")
+    return head
 
 
 def win_build(cfg, name, build_mode, run_ref):
@@ -883,7 +905,10 @@ def cmd_ship_windows(name, build_mode, run_ref):
 def cmd_site(dry_run):
     dep = expand("~/.blacklabelbots/_deploy")
     print(f"== bl-ship site {'(DRY RUN)' if dry_run else ''} ==")
+    assert_exact_git_root(dep, "site")
     r = _run(["git", "-C", dep, "status", "--porcelain"])
+    if r.returncode != 0:
+        fail("site: git status failed")
     dirty = [l for l in r.stdout.splitlines() if l.strip()]
     if dirty:
         fail(f"site: _deploy dirty ({len(dirty)} entries) — commit first (provenance)")
