@@ -9,14 +9,26 @@
 set -uo pipefail
 
 BUCKET="blacklabel-backups"
-DEPLOY="$HOME/.blacklabelbots/_deploy"
-KEYFILE="$HOME/.utah/secrets/backup-key.txt"
-LOG="$HOME/.utah/logs/backup-offsite.log"
+CONTENT_ROOT="${BACKUP_CONTENT_ROOT:-$HOME}"
+DEPLOY="${OFFSITE_DEPLOY_ROOT:-$HOME/.blacklabelbots/_deploy}"
+KEYFILE="${BACKUP_KEYFILE:-$HOME/.utah/secrets/backup-key.txt}"
+LOG="${OFFSITE_LOG:-$HOME/.utah/logs/backup-offsite.log}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-WORK="$(mktemp -d)"
-mkdir -p "$HOME/.utah/logs"
+mkdir -p "$(dirname "$LOG")"
 
 log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a "$LOG"; }
+
+# Stop before the D1 export and state bundle if a prior large upload still owns
+# a journal lock. The snapshot helper also holds a global lane lock for new runs.
+SNAP_PYTHON="${BACKUP_PYTHON:-/usr/bin/python3}"
+SNAP_STATE_DIR="${SNAP_STATE_DIR:-$HOME/.utah/run/encrypted-backups}"
+if ! "$SNAP_PYTHON" "$SCRIPT_DIR/tools/encrypted_snapshot.py" idle --state-dir "$SNAP_STATE_DIR" >/dev/null 2>&1; then
+  log "FATAL: off-site upload preflight not idle; cycle deferred"
+  exit 1
+fi
+WORK="$(mktemp -d)"
+trap 'if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf -- "$WORK"; fi' EXIT
 
 # 1. Backup encryption key (generate once, 600). Michael must ALSO store this off-machine.
 if [[ ! -s "$KEYFILE" ]]; then
@@ -28,10 +40,10 @@ fi
 # 2. Stage the irreplaceable state.
 STAGE="$WORK/blacklabel-state"
 mkdir -p "$STAGE"
-cp "$HOME/BlackLabelShip/ships.jsonl" "$STAGE/" 2>/dev/null && log "staged ships.jsonl"
-cp -R "$HOME/.utah/secrets" "$STAGE/secrets" 2>/dev/null && log "staged secrets/"
-cp -R "$HOME/.utah/partner" "$STAGE/partner" 2>/dev/null
-cp "$HOME/RUN-LOG.md" "$HOME/ATLAS.md" "$STAGE/" 2>/dev/null
+cp "$CONTENT_ROOT/BlackLabelShip/ships.jsonl" "$STAGE/" 2>/dev/null && log "staged ships.jsonl"
+cp -R "$CONTENT_ROOT/.utah/secrets" "$STAGE/secrets" 2>/dev/null && log "staged secrets/"
+cp -R "$CONTENT_ROOT/.utah/partner" "$STAGE/partner" 2>/dev/null
+cp "$CONTENT_ROOT/RUN-LOG.md" "$CONTENT_ROOT/ATLAS.md" "$STAGE/" 2>/dev/null
 
 # 3. D1 export (best-effort — a slow/failed export must not sink the backup).
 if ( cd "$DEPLOY" && npx --yes wrangler d1 export blacklabel-leads \
@@ -63,8 +75,24 @@ if ( cd "$DEPLOY" && npx --yes wrangler r2 object put "$BUCKET/$KEY" \
   ( cd "$DEPLOY" && npx --yes wrangler r2 object put "$BUCKET/latest.tar.gz.enc" \
       --file "$ENC" --remote >>"$LOG" 2>&1 ) && log "UPLOADED r2://$BUCKET/latest.tar.gz.enc"
 else
-  log "FATAL: R2 upload failed"; rm -rf "$WORK"; exit 1
+  log "FATAL: R2 upload failed"; exit 1
 fi
 
-rm -rf "$WORK"
+rm -rf -- "$WORK"
+WORK=""
+log "state bundle complete: $KEY ($SZ)"
+
+# 7. Off-site the restore-proven snapshot set (large pg dumps + brain-state).
+#    The state-bundle receipt remains valid if this separate lane fails, but
+#    the aggregate job must fail so monitoring cannot report a complete backup.
+if [[ ! -x "$SCRIPT_DIR/backup_offsite_snapshot.sh" ]]; then
+  log "FATAL: snapshot entrypoint missing; state bundle succeeded, overall backup incomplete"
+  exit 1
+fi
+if bash "$SCRIPT_DIR/backup_offsite_snapshot.sh"; then
+  log "encrypted snapshot off-site OK"
+else
+  log "FATAL: snapshot off-site failed; state bundle succeeded, overall backup incomplete"
+  exit 1
+fi
 log "backup complete: $KEY ($SZ)"
