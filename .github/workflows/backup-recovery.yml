@@ -7,8 +7,10 @@ on:
       - backup_offsite.sh
       - backup_offsite_snapshot.sh
       - tools/encrypted_snapshot.py
+      - tools/source_rescue_offsite.py
       - test_encrypted_snapshot.py
       - test_offsite_wrapper.py
+      - test_source_rescue_offsite.py
       - .github/workflows/backup-recovery.yml
   push:
     branches: [main]
@@ -16,8 +18,10 @@ on:
       - backup_offsite.sh
       - backup_offsite_snapshot.sh
       - tools/encrypted_snapshot.py
+      - tools/source_rescue_offsite.py
       - test_encrypted_snapshot.py
       - test_offsite_wrapper.py
+      - test_source_rescue_offsite.py
       - .github/workflows/backup-recovery.yml
   workflow_dispatch:
 
@@ -44,4 +48,4 @@ jobs:
           bash -n backup_offsite_snapshot.sh
           zsh -n backup_offsite.sh
       - name: Run encrypted backup and wrapper regressions
-        run: python3 -m unittest test_encrypted_snapshot.py test_offsite_wrapper.py
+        run: python3 -m unittest test_encrypted_snapshot.py test_offsite_wrapper.py test_source_rescue_offsite.py
