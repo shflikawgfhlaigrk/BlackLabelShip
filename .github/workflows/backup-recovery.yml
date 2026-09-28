@@ -1,0 +1,41 @@
+name: Backup recovery tests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - backup_offsite.sh
+      - backup_offsite_snapshot.sh
+      - tools/encrypted_snapshot.py
+      - test_encrypted_snapshot.py
+      - test_offsite_wrapper.py
+      - .github/workflows/backup-recovery.yml
+  push:
+    branches: [main]
+    paths:
+      - backup_offsite.sh
+      - backup_offsite_snapshot.sh
+      - tools/encrypted_snapshot.py
+      - test_encrypted_snapshot.py
+      - test_offsite_wrapper.py
+      - .github/workflows/backup-recovery.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup-recovery:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check recovery tools and shell syntax
+        run: |
+          command -v python3
+          command -v gpg
+          command -v zsh
+          bash -n backup_offsite_snapshot.sh
+          zsh -n backup_offsite.sh
+      - name: Run encrypted backup and wrapper regressions
+        run: python3 -m unittest test_encrypted_snapshot.py test_offsite_wrapper.py
