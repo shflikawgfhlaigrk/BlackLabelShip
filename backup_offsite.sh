@@ -15,10 +15,20 @@ KEYFILE="${BACKUP_KEYFILE:-$HOME/.utah/secrets/backup-key.txt}"
 LOG="${OFFSITE_LOG:-$HOME/.utah/logs/backup-offsite.log}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-WORK="$(mktemp -d)"
 mkdir -p "$(dirname "$LOG")"
 
 log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a "$LOG"; }
+
+# Stop before the D1 export and state bundle if a prior large upload still owns
+# a journal lock. The snapshot helper also holds a global lane lock for new runs.
+SNAP_PYTHON="${BACKUP_PYTHON:-/usr/bin/python3}"
+SNAP_STATE_DIR="${SNAP_STATE_DIR:-$HOME/.utah/run/encrypted-backups}"
+if ! "$SNAP_PYTHON" "$SCRIPT_DIR/tools/encrypted_snapshot.py" idle --state-dir "$SNAP_STATE_DIR" >/dev/null 2>&1; then
+  log "FATAL: off-site upload preflight not idle; cycle deferred"
+  exit 1
+fi
+WORK="$(mktemp -d)"
+trap 'if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf -- "$WORK"; fi' EXIT
 
 # 1. Backup encryption key (generate once, 600). Michael must ALSO store this off-machine.
 if [[ ! -s "$KEYFILE" ]]; then
@@ -65,10 +75,11 @@ if ( cd "$DEPLOY" && npx --yes wrangler r2 object put "$BUCKET/$KEY" \
   ( cd "$DEPLOY" && npx --yes wrangler r2 object put "$BUCKET/latest.tar.gz.enc" \
       --file "$ENC" --remote >>"$LOG" 2>&1 ) && log "UPLOADED r2://$BUCKET/latest.tar.gz.enc"
 else
-  log "FATAL: R2 upload failed"; rm -rf "$WORK"; exit 1
+  log "FATAL: R2 upload failed"; exit 1
 fi
 
-rm -rf "$WORK"
+rm -rf -- "$WORK"
+WORK=""
 log "state bundle complete: $KEY ($SZ)"
 
 # 7. Off-site the restore-proven snapshot set (large pg dumps + brain-state).

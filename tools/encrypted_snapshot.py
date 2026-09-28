@@ -452,6 +452,30 @@ def journal_lock(journal):
         os.close(fd)
 
 
+@contextlib.contextmanager
+def upload_lane_lock(state_dir):
+    """Exclude new uploaders and detect uploaders started before this lock existed."""
+    state_dir = Path(state_dir)
+    fd = os.open(state_dir / "upload-lane.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise BackupError("Another snapshot uploader is active") from None
+        for path in state_dir.glob("*.json.lock"):
+            old_fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+            try:
+                try:
+                    fcntl.flock(old_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise BackupError("Another snapshot uploader is active") from None
+            finally:
+                os.close(old_fd)
+        yield
+    finally:
+        os.close(fd)
+
+
 def upload(snapshot, store, crypto, work, journal, chunk_bytes=CHUNK_BYTES,
            namespace="encrypted-v1", publish_latest=True, progress=None):
     if namespace not in ("encrypted-v1", "encrypted-canary-v1") or not 1 <= chunk_bytes <= CHUNK_BYTES:
@@ -648,7 +672,7 @@ def verify(store, crypto, work, prefix=None, destination=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("upload", "verify", "restore", "inspect"))
+    parser.add_argument("operation", choices=("upload", "verify", "restore", "inspect", "idle"))
     parser.add_argument("--snapshot-dir", type=Path)
     parser.add_argument("--manifest")
     parser.add_argument("--prefix")
@@ -672,6 +696,11 @@ def main(argv=None):
             print(json.dumps(read_snapshot(args.snapshot_dir, args.manifest), sort_keys=True))
             return 0
         state = private_dir(args.state_dir)
+        if args.operation == "idle":
+            with upload_lane_lock(state):
+                pass
+            print(json.dumps({"status": "idle"}, sort_keys=True))
+            return 0
         with tempfile.TemporaryDirectory(prefix="work-", dir=state) as work:
             crypto = GPG(args.key_file, work)
             store = LocalStore(args.local_store) if args.local_store else R2Store(args.account, args.bucket, args.credential_file)
@@ -690,8 +719,9 @@ def main(argv=None):
                     old_state = json.loads(legacy_journal.read_text())
                     if old_state.get("binding", {}).get("chunk_bytes") == args.chunk_bytes:
                         journal = legacy_journal
-                report = upload(snapshot, store, crypto, work, journal, args.chunk_bytes,
-                                args.namespace, not args.no_latest, lambda value: print(json.dumps(value), flush=True))
+                with upload_lane_lock(state):
+                    report = upload(snapshot, store, crypto, work, journal, args.chunk_bytes,
+                                    args.namespace, not args.no_latest, lambda value: print(json.dumps(value), flush=True))
             else:
                 if args.operation == "restore" and args.destination is None:
                     parser.error("--destination is required")

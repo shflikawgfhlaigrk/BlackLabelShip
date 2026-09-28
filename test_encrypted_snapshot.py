@@ -350,6 +350,24 @@ class BackupTests(unittest.TestCase):
         with backup.journal_lock(journal), self.assertRaisesRegex(backup.BackupError, "active uploader"):
             self.upload_new()
 
+    def test_lane_rejects_upload_started_before_global_lock(self):
+        state = backup.private_dir(self.root / "lane")
+        with backup.journal_lock(state / "previous.json"):
+            with self.assertRaisesRegex(backup.BackupError, "Another snapshot uploader is active"):
+                with backup.upload_lane_lock(state):
+                    pass
+            self.assertEqual(backup.main(["idle", "--state-dir", str(state)]), 1)
+        with backup.upload_lane_lock(state):
+            pass
+        self.assertEqual(backup.main(["idle", "--state-dir", str(state)]), 0)
+
+    def test_lane_rejects_second_new_uploader(self):
+        state = backup.private_dir(self.root / "lane")
+        with backup.upload_lane_lock(state):
+            with self.assertRaisesRegex(backup.BackupError, "Another snapshot uploader is active"):
+                with backup.upload_lane_lock(state):
+                    pass
+
     def test_canary_cannot_publish_latest(self):
         with self.assertRaises(backup.BackupError):
             self.upload_new(namespace="encrypted-canary-v1")
