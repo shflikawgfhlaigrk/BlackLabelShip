@@ -34,10 +34,13 @@ permissions:
 
 jobs:
   backup-recovery:
-    runs-on: [self-hosted, Linux, X64]
+    # Public PR code runs only on disposable GitHub-hosted VMs.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install zsh for the production wrapper test
         run: |
           if ! command -v zsh >/dev/null; then
