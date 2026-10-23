@@ -1,4 +1,4 @@
-name: CodeQL (self-hosted)
+name: CodeQL (GitHub-hosted)
 
 on:
   push:
@@ -12,7 +12,8 @@ on:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: [self-hosted, Linux, X64]
+    # Public PR code runs only on disposable GitHub-hosted VMs.
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       # actions:read is required on PRIVATE repos — without it the analysis runs
@@ -28,6 +29,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
