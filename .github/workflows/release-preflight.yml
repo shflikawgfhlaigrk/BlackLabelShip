@@ -9,12 +9,15 @@ on:
 
 jobs:
   provenance:
-    runs-on: [self-hosted, Linux, X64]
+    # Public PR code runs only on disposable GitHub-hosted VMs.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Check release script syntax and provenance gates
         run: |
           python3 -m py_compile ship.py test_repo_root.py test_windows_lane.py test_redaction.py
