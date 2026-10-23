@@ -39,6 +39,9 @@ PREFIX = rf"encrypted-(?:canary-)?v1/[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}/{STAMP}/[a
 REQUEST_SECONDS = 180
 OAUTH_MARGIN_SECONDS = 30
 OAUTH_WAIT_SECONDS = REQUEST_SECONDS + OAUTH_MARGIN_SECONDS + 2
+# Cloudflare's edge-specific temporary failures include 524 (origin timeout).
+# Retrying PUT uses the same key and ciphertext; readback still verifies it.
+RETRYABLE_HTTP = frozenset((408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524))
 
 
 class BackupError(Exception):
@@ -318,7 +321,8 @@ class R2Store:
                             raise BackupError("R2 PUT did not report success")
                     return
             except urllib.error.HTTPError as error:
-                if error.code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
+                error.close()
+                if error.code not in RETRYABLE_HTTP or attempt == 2:
                     raise BackupError(f"R2 PUT HTTP {error.code}") from None
             except (urllib.error.URLError, TimeoutError, OSError):
                 if attempt == 2:
@@ -343,7 +347,8 @@ class R2Store:
                         target.write(data)
                 return
             except urllib.error.HTTPError as error:
-                if error.code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
+                error.close()
+                if error.code not in RETRYABLE_HTTP or attempt == 2:
                     raise BackupError(f"R2 GET HTTP {error.code}") from None
             except (urllib.error.URLError, TimeoutError, OSError):
                 if attempt == 2:

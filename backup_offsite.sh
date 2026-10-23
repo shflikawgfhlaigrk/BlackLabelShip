@@ -8,6 +8,17 @@
 # BEFORE it leaves the machine. Idempotent (dated object), logged, non-destructive.
 set -uo pipefail
 
+STATE_ONLY=0
+case "${1:-}" in
+  "") ;;
+  --state-only) STATE_ONLY=1 ;;
+  *) echo "usage: $0 [--state-only]" >&2; exit 2 ;;
+esac
+if (( $# > 1 )); then
+  echo "usage: $0 [--state-only]" >&2
+  exit 2
+fi
+
 BUCKET="blacklabel-backups"
 CONTENT_ROOT="${BACKUP_CONTENT_ROOT:-$HOME}"
 DEPLOY="${OFFSITE_DEPLOY_ROOT:-$HOME/.blacklabelbots/_deploy}"
@@ -23,7 +34,7 @@ log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a "$LOG"; }
 # a journal lock. The snapshot helper also holds a global lane lock for new runs.
 SNAP_PYTHON="${BACKUP_PYTHON:-/usr/bin/python3}"
 SNAP_STATE_DIR="${SNAP_STATE_DIR:-$HOME/.utah/run/encrypted-backups}"
-if ! "$SNAP_PYTHON" "$SCRIPT_DIR/tools/encrypted_snapshot.py" idle --state-dir "$SNAP_STATE_DIR" >/dev/null 2>&1; then
+if (( ! STATE_ONLY )) && ! "$SNAP_PYTHON" "$SCRIPT_DIR/tools/encrypted_snapshot.py" idle --state-dir "$SNAP_STATE_DIR" >/dev/null 2>&1; then
   log "FATAL: off-site upload preflight not idle; cycle deferred"
   exit 1
 fi
@@ -41,7 +52,16 @@ fi
 STAGE="$WORK/blacklabel-state"
 mkdir -p "$STAGE"
 cp "$CONTENT_ROOT/BlackLabelShip/ships.jsonl" "$STAGE/" 2>/dev/null && log "staged ships.jsonl"
-cp -R "$CONTENT_ROOT/.utah/secrets" "$STAGE/secrets" 2>/dev/null && log "staged secrets/"
+# Resolve the vault link so the encrypted archive contains restorable files.
+if [[ ! -d "$CONTENT_ROOT/.utah/secrets" ]] || ! cp -RL "$CONTENT_ROOT/.utah/secrets" "$STAGE/secrets"; then
+  log "FATAL: secrets staging failed; no bundle uploaded"
+  exit 1
+fi
+if [[ -n "$(find "$STAGE/secrets" -type l -print -quit)" ]] || [[ -z "$(find "$STAGE/secrets" -type f -print -quit)" ]]; then
+  log "FATAL: secrets staging incomplete; no bundle uploaded"
+  exit 1
+fi
+log "staged secrets/ contents"
 cp -R "$CONTENT_ROOT/.utah/partner" "$STAGE/partner" 2>/dev/null
 cp "$CONTENT_ROOT/RUN-LOG.md" "$CONTENT_ROOT/ATLAS.md" "$STAGE/" 2>/dev/null
 
@@ -72,8 +92,13 @@ KEY="daily/blacklabel-backup-$STAMP.tar.gz.enc"
 if ( cd "$DEPLOY" && npx --yes wrangler r2 object put "$BUCKET/$KEY" \
        --file "$ENC" --remote >>"$LOG" 2>&1 ); then
   log "UPLOADED r2://$BUCKET/$KEY"
-  ( cd "$DEPLOY" && npx --yes wrangler r2 object put "$BUCKET/latest.tar.gz.enc" \
-      --file "$ENC" --remote >>"$LOG" 2>&1 ) && log "UPLOADED r2://$BUCKET/latest.tar.gz.enc"
+  if ( cd "$DEPLOY" && npx --yes wrangler r2 object put "$BUCKET/latest.tar.gz.enc" \
+      --file "$ENC" --remote >>"$LOG" 2>&1 ); then
+    log "UPLOADED r2://$BUCKET/latest.tar.gz.enc"
+  else
+    log "FATAL: latest state-bundle upload failed"
+    exit 1
+  fi
 else
   log "FATAL: R2 upload failed"; exit 1
 fi
@@ -81,6 +106,9 @@ fi
 rm -rf -- "$WORK"
 WORK=""
 log "state bundle complete: $KEY ($SZ)"
+if (( STATE_ONLY )); then
+  exit 0
+fi
 
 # 7. Off-site the restore-proven snapshot set (large pg dumps + brain-state).
 #    The state-bundle receipt remains valid if this separate lane fails, but

@@ -9,6 +9,7 @@ umask 077
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${BACKUP_PYTHON:-/usr/bin/python3}"
 HELPER="$SCRIPT_DIR/tools/encrypted_snapshot.py"
+SELECTOR="$SCRIPT_DIR/tools/select_snapshot_attempt.py"
 BACKUPS_ROOT="${BACKUPS_ROOT:-$HOME/BlackLabelBackups}"
 LOG="${OFFSITE_LOG:-$HOME/.utah/logs/backup-offsite.log}"
 STATE_DIR="${SNAP_STATE_DIR:-$HOME/.utah/run/encrypted-backups}"
@@ -22,28 +23,34 @@ REQUESTED_SNAPSHOT_MANIFEST="${SNAPSHOT_MANIFEST:-}"
 mkdir -p "$(dirname "$LOG")" "$STATE_DIR"
 
 log() { echo "[$(date -u +%FT%TZ)] snapshot: $*" | tee -a "$LOG"; }
+if [[ -n "$REQUESTED_SNAPSHOT_MANIFEST" && -z "$REQUESTED_SNAPSHOT_DIR" ]] || \
+   [[ -n "$REQUESTED_SNAPSHOT_DIR" && -z "$REQUESTED_SNAPSHOT_MANIFEST" ]]; then
+  log 'FATAL: explicit snapshot directory and manifest must be supplied together'
+  exit 1
+fi
 case "$WAIT_SECS:$POLL_SECS" in *[!0-9:]*|:*) log 'FATAL: invalid snapshot wait interval'; exit 1;; esac
 [[ "$POLL_SECS" -gt 0 ]] || { log 'FATAL: poll interval must be positive'; exit 1; }
 case "$CHUNK_BYTES" in ''|*[!0-9]*) log 'FATAL: invalid snapshot chunk size'; exit 1;; esac
 [[ "$CHUNK_BYTES" -ge 1 && "$CHUNK_BYTES" -le 304087040 ]] || { log 'FATAL: snapshot chunk size out of range'; exit 1; }
 
 manifest_ready() {
+  CHOSEN_MANIFEST="$REQUESTED_SNAPSHOT_MANIFEST"
   if [[ -n "$REQUESTED_SNAPSHOT_DIR" ]]; then
     SNAPDIR="$REQUESTED_SNAPSHOT_DIR"
   else
-    SNAPDIR="$("$PYTHON" - "$BACKUPS_ROOT" <<'PY'
-from pathlib import Path
-import re, sys
-root = Path(sys.argv[1])
-dirs = sorted(p for p in root.glob('*') if p.is_dir() and re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', p.name))
-if dirs: print(dirs[-1])
-PY
-    )"
+    local selection status selected_dir selected_manifest
+    selection="$("$PYTHON" "$SELECTOR" --root "$BACKUPS_ROOT")"
+    IFS=$'\t' read -r status selected_dir selected_manifest <<< "$selection"
+    case "$status" in
+      ready) SNAPDIR="$selected_dir"; CHOSEN_MANIFEST="$selected_manifest" ;;
+      wait) return 1 ;;
+      *) log 'FATAL: newest local snapshot attempt is failed, stale, or invalid'; exit 1 ;;
+    esac
   fi
   [[ -n "$SNAPDIR" ]] || return 1
   local inspect_args=(inspect --snapshot-dir "$SNAPDIR")
-  if [[ -n "$REQUESTED_SNAPSHOT_MANIFEST" ]]; then
-    inspect_args+=(--manifest "$REQUESTED_SNAPSHOT_MANIFEST")
+  if [[ -n "$CHOSEN_MANIFEST" ]]; then
+    inspect_args+=(--manifest "$CHOSEN_MANIFEST")
   fi
   "$PYTHON" "$HELPER" "${inspect_args[@]}" >/dev/null 2>&1
 }
@@ -54,15 +61,15 @@ until manifest_ready; do
     log "FATAL: no exact complete snapshot manifest under $BACKUPS_ROOT after ${WAIT_SECS}s"
     exit 1
   fi
-  log 'waiting on the complete three-artifact snapshot manifest'
+  log 'waiting on the newest local snapshot attempt to finish'
   sleep "$POLL_SECS"
 done
 
 ARGS=(upload --snapshot-dir "$SNAPDIR" --key-file "$KEYFILE"
       --credential-file "$CREDENTIAL" --state-dir "$STATE_DIR"
       --chunk-bytes "$CHUNK_BYTES" --receipt "$STATE_DIR/last-upload.json")
-if [[ -n "$REQUESTED_SNAPSHOT_MANIFEST" ]]; then
-  ARGS+=(--manifest "$REQUESTED_SNAPSHOT_MANIFEST")
+if [[ -n "$CHOSEN_MANIFEST" ]]; then
+  ARGS+=(--manifest "$CHOSEN_MANIFEST")
 fi
 # Explicit offline integration testing must never satisfy the production monitor.
 if [[ -n "${BACKUP_LOCAL_TEST_STORE:-}" ]]; then

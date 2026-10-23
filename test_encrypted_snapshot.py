@@ -618,6 +618,53 @@ class R2LifetimeTests(unittest.TestCase):
         self.assertEqual(attempts, [("part.gpg", "GET")])
         wait.assert_not_called()
 
+    def test_cloudflare_edge_timeout_retries_same_ciphertext_and_key(self):
+        source = self.root / "part.gpg"
+        source.write_bytes(b"synthetic-ciphertext")
+        for method in ("PUT", "GET"):
+            for code in (520, 521, 522, 523, 524):
+                with self.subTest(method=method, code=code):
+                    attempts = []
+                    @contextlib.contextmanager
+                    def request(key, verb, data=None):
+                        attempts.append((key, verb, data.read() if data else None))
+                        if len(attempts) == 1:
+                            raise backup.urllib.error.HTTPError("https://synthetic.invalid", code, "temporary", {}, io.BytesIO())
+                        response = Mock()
+                        response.headers = {"Content-Length": "8"}
+                        if verb == "PUT":
+                            response.read.return_value = b'{"success":true}'
+                        else:
+                            response.read.side_effect = [b"complete", b""]
+                        yield response
+                    with patch.object(self.store, "request", side_effect=request), patch.object(backup.time, "sleep") as wait:
+                        if method == "PUT":
+                            self.store.put("part.gpg", source)
+                        else:
+                            target = self.root / "download.gpg"
+                            self.store.get("part.gpg", target, 100)
+                            self.assertEqual(target.read_bytes(), b"complete")
+                    self.assertEqual(len(attempts), 2)
+                    self.assertEqual(attempts[0], attempts[1])
+                    wait.assert_called_once_with(1)
+
+    def test_http_retry_budget_and_permanent_failures(self):
+        source = self.root / "part.gpg"
+        source.write_bytes(b"synthetic-ciphertext")
+        for method in ("PUT", "GET"):
+            for code, expected_attempts in ((524, 3), (401, 1), (403, 1), (404, 1)):
+                with self.subTest(method=method, code=code):
+                    error = backup.urllib.error.HTTPError("https://synthetic.invalid", code, "failure", {}, io.BytesIO())
+                    with patch.object(self.store, "request", side_effect=error) as request, \
+                         patch.object(backup.time, "sleep") as wait, \
+                         self.assertRaisesRegex(backup.BackupError, f"^R2 {method} HTTP {code}$"):
+                        if method == "PUT":
+                            self.store.put("part.gpg", source)
+                        else:
+                            self.store.get("part.gpg", self.root / "download.gpg", 100)
+                    self.assertEqual(request.call_count, expected_attempts)
+                    self.assertEqual(wait.call_count, expected_attempts - 1)
+
     def test_existing_alarm_is_preserved_and_no_request_is_sent(self):
         with patch.object(backup.signal, 'getitimer', return_value=(20.0, 0.0)), \
              patch.object(backup.signal, 'setitimer') as reset, \
