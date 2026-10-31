@@ -75,6 +75,11 @@ class SourceRescueOffsiteTests(unittest.TestCase):
             def get(self, key, path, limit):
                 return self.inner.get(key, path, limit)
 
+            def put_if_version(self, key, path, version):
+                if key == rescue.LATEST:
+                    raise base.BackupError("injected pointer failure")
+                return self.inner.put_if_version(key, path, version)
+
         snapshot = rescue.inspect(self.source)
         work = base.private_dir(self.root / "work")
         crypto = base.GPG(self.key, work)

@@ -39,6 +39,9 @@ PREFIX = rf"encrypted-(?:canary-)?v1/[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}/{STAMP}/[a
 REQUEST_SECONDS = 180
 OAUTH_MARGIN_SECONDS = 30
 OAUTH_WAIT_SECONDS = REQUEST_SECONDS + OAUTH_MARGIN_SECONDS + 2
+# Cloudflare's edge-specific temporary failures include 524 (origin timeout).
+# Retrying PUT uses the same key and ciphertext; readback still verifies it.
+RETRYABLE_HTTP = frozenset((408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524))
 
 
 class BackupError(Exception):
@@ -293,7 +296,7 @@ class R2Store:
         return raw
 
     @contextlib.contextmanager
-    def request(self, key, method, source=None):
+    def request(self, key, method, source=None, condition=None):
         require_request_runner()
         if not re.fullmatch(r"[A-Za-z0-9._/-]+", key) or ".." in key.split("/"):
             raise BackupError("Invalid R2 object key")
@@ -303,6 +306,8 @@ class R2Store:
                    "User-Agent": "BlackLabelEncryptedBackup/1", "Accept-Encoding": "identity"}
         if source is not None:
             headers.update({"Content-Type": "application/octet-stream", "Content-Length": str(os.fstat(source.fileno()).st_size)})
+        if condition is not None:
+            headers.update(condition)
         with request_deadline():
             with self.opener.open(urllib.request.Request(url, data=source, method=method, headers=headers), timeout=REQUEST_SECONDS) as response:
                 yield response
@@ -318,7 +323,8 @@ class R2Store:
                             raise BackupError("R2 PUT did not report success")
                     return
             except urllib.error.HTTPError as error:
-                if error.code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
+                error.close()
+                if error.code not in RETRYABLE_HTTP or attempt == 2:
                     raise BackupError(f"R2 PUT HTTP {error.code}") from None
             except (urllib.error.URLError, TimeoutError, OSError):
                 if attempt == 2:
@@ -327,6 +333,25 @@ class R2Store:
                 if str(error) != "R2 request wall deadline exceeded" or attempt == 2:
                     raise
             time.sleep(2 ** attempt)
+
+    def put_if_version(self, key, path, version):
+        """Compare-and-swap; an ambiguous response is never retried unconditionally."""
+        if version is not None and not re.fullmatch(r'"[^"\r\n]+"', version):
+            raise BackupError("Conditional write requires a strong object ETag")
+        condition = {"If-None-Match": "*"} if version is None else {"If-Match": version}
+        try:
+            with Path(path).open("rb") as data, self.request(key, "PUT", data, condition) as reply:
+                raw = reply.read(1024 * 1024)
+                if raw and json.loads(raw).get("success") is not True:
+                    raise BackupError("R2 conditional PUT did not report success")
+            return True
+        except urllib.error.HTTPError as error:
+            error.close()
+            if error.code == 412:
+                return False
+            raise BackupError(f"R2 conditional PUT HTTP {error.code}") from None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            raise BackupError("R2 conditional PUT outcome unknown; resume to reconcile") from None
 
     def get(self, key, path, limit):
         for attempt in range(3):
@@ -341,9 +366,12 @@ class R2Store:
                         if size > limit:
                             raise BackupError("Remote object exceeds its bound")
                         target.write(data)
-                return
+                return response.headers.get("ETag")
             except urllib.error.HTTPError as error:
-                if error.code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
+                error.close()
+                if error.code == 404:
+                    raise FileNotFoundError("R2 object does not exist") from None
+                if error.code not in RETRYABLE_HTTP or attempt == 2:
                     raise BackupError(f"R2 GET HTTP {error.code}") from None
             except (urllib.error.URLError, TimeoutError, OSError):
                 if attempt == 2:
@@ -369,13 +397,35 @@ class LocalStore:
     def put(self, key, path):
         dest = self.path(key)
         dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        shutil.copyfile(path, dest)
+        fd, tmp = tempfile.mkstemp(prefix=".put-", dir=dest.parent)
+        try:
+            with os.fdopen(fd, "wb") as output, Path(path).open("rb") as source:
+                shutil.copyfileobj(source, output)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(tmp, dest)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+    def put_if_version(self, key, path, version):
+        # A lock beside the store is shared by independent processes and clients.
+        # The object itself is atomically replaced so readers get one whole version.
+        token = hashlib.sha256(str(self.root.resolve()).encode() + b"\0" + key.encode()).hexdigest()
+        with journal_lock(self.root.parent / (".object-" + token)):
+            dest = self.path(key)
+            current = '"' + digest(dest) + '"' if dest.exists() else None
+            if current != version:
+                return False
+            self.put(key, path)
+            return True
 
     def get(self, key, path, limit):
         source = self.path(key)
         if source.stat().st_size > limit:
             raise BackupError("Remote object exceeds its bound")
         shutil.copyfile(source, path)
+        return '"' + digest(path) + '"'
 
 
 def verified_put(store, key, cipher, crypto, work, expected):
@@ -452,6 +502,95 @@ def journal_lock(journal):
         os.close(fd)
 
 
+@contextlib.contextmanager
+def upload_lane_lock(state_dir):
+    """Exclude new uploaders and detect uploaders started before this lock existed."""
+    state_dir = Path(state_dir)
+    fd = os.open(state_dir / "upload-lane.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise BackupError("Another snapshot uploader is active") from None
+        for path in state_dir.glob("*.json.lock"):
+            old_fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+            try:
+                try:
+                    fcntl.flock(old_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise BackupError("Another snapshot uploader is active") from None
+            finally:
+                os.close(old_fd)
+        yield
+    finally:
+        os.close(fd)
+
+
+def read_pointer(store, crypto, work, key, schema, prefix_pattern):
+    cipher = Path(work) / "pointer.gpg"
+    try:
+        version = store.get(key, cipher, MAX_MANIFEST_BYTES)
+        pointer = crypto.decrypt_json(cipher)
+        if (not isinstance(pointer, dict) or pointer.get("schema") != schema + ".pointer"
+                or not isinstance(pointer.get("prefix"), str)
+                or not re.fullmatch(prefix_pattern, pointer["prefix"])):
+            raise BackupError("Invalid latest pointer")
+        meta = pointer.get("manifest")
+        if (not isinstance(meta, dict) or meta.get("key") != pointer["prefix"] + "/manifest.json.gpg"
+                or any(not isinstance(meta.get(k), str) or not re.fullmatch(HASH, meta[k])
+                       for k in ("sha256", "cipher_sha256"))
+                or any(type(meta.get(k)) is not int or not 0 < meta[k] <= MAX_MANIFEST_BYTES
+                       for k in ("bytes", "cipher_bytes"))):
+            raise BackupError("Invalid latest pointer manifest binding")
+        return pointer, version
+    finally:
+        cipher.unlink(missing_ok=True)
+
+
+def publish_latest(store, crypto, work, key, schema, prefix_pattern, prefix, meta, loader, rank,
+                   read_only=False):
+    """Publish only forward, across clients, using the version actually read.
+
+    Missing is distinct from unreadable/corrupt. Existing pointers and their
+    manifest bindings must authenticate before comparison. CAS conflicts cause
+    a bounded re-read; no failure falls back to a blind write.
+    """
+    candidate = loader(store, crypto, work, prefix)
+    candidate_rank = rank(candidate)
+    cipher = Path(work) / "latest-upload.gpg"
+    wrote = False
+    try:
+        for _ in range(8):
+            try:
+                current, version = read_pointer(store, crypto, work, key, schema, prefix_pattern)
+            except FileNotFoundError:
+                if read_only:
+                    raise
+                current, version = None, None
+            if current is not None:
+                if not version:
+                    raise BackupError("Latest pointer has no conditional-write version")
+                fetch_part(store, current["manifest"], crypto, work)
+                existing = loader(store, crypto, work, current["prefix"])
+                existing_rank = rank(existing)
+                if existing_rank >= candidate_rank:
+                    same = current["prefix"] == prefix
+                    status = ("published" if wrote else "already_current") if same else (
+                        "retained_newer" if existing_rank > candidate_rank else "retained_same_version")
+                    return {"latest_published": same, "latest_prefix": current["prefix"],
+                            "latest_status": status}
+            if read_only:
+                raise BackupError("Completed upload pointer moved backward")
+            raw = encode({"schema": schema + ".pointer", "prefix": prefix, "manifest": meta})
+            crypto.encrypt(raw, cipher)
+            # Always re-read after a successful write as well: another client
+            # may already have advanced it. Its newer pointer is a valid outcome.
+            wrote = store.put_if_version(key, cipher, version) or wrote
+        raise BackupError("Latest pointer changed repeatedly; resume to reconcile")
+    finally:
+        cipher.unlink(missing_ok=True)
+
+
 def upload(snapshot, store, crypto, work, journal, chunk_bytes=CHUNK_BYTES,
            namespace="encrypted-v1", publish_latest=True, progress=None):
     if namespace not in ("encrypted-v1", "encrypted-canary-v1") or not 1 <= chunk_bytes <= CHUNK_BYTES:
@@ -474,14 +613,16 @@ def upload(snapshot, store, crypto, work, journal, chunk_bytes=CHUNK_BYTES,
         if not re.fullmatch(PREFIX, prefix):
             raise BackupError("Unsafe resume prefix")
         if state.get("status") == "complete":
-            if state.get("latest_published") != publish_latest:
+            if state.get("publish_latest_requested", state.get("latest_published")) != publish_latest:
                 raise BackupError("Completed upload latest-pointer policy changed")
             report = verify(store, crypto, work, prefix)
             if report["files"] != state.get("files"):
                 raise BackupError("Completed upload journal and remote files differ")
-            if publish_latest and load_manifest(store, crypto, work)["prefix"] != prefix:
-                raise BackupError("Completed upload is not the remote latest snapshot")
-            return {**report, "operation": "upload", "latest_published": publish_latest,
+            latest = {"latest_published": False, "latest_status": "not_requested"}
+            if publish_latest:
+                latest = publish_snapshot_latest(store, crypto, work, namespace, prefix,
+                                                 state["manifest"], read_only=True)
+            return {**report, "operation": "upload", **latest,
                     "reverified": True}
         files = []
         cipher = Path(work) / "upload.gpg"
@@ -539,18 +680,16 @@ def upload(snapshot, store, crypto, work, journal, chunk_bytes=CHUNK_BYTES,
                                     {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()})
                 state["manifest"] = meta
                 save_json(journal, state)
+            latest = {"latest_published": False, "latest_status": "not_requested"}
             if publish_latest:
-                pointer = encode({"schema": SCHEMA + ".pointer", "prefix": prefix, "manifest": meta})
-                crypto.encrypt(pointer, cipher)
-                verified_put(store, namespace + "/LATEST.gpg", cipher, crypto, work,
-                             {"bytes": len(pointer), "sha256": hashlib.sha256(pointer).hexdigest()})
+                latest = publish_snapshot_latest(store, crypto, work, namespace, prefix, meta)
             state.update({"status": "complete", "completed_at": utc(), "manifest": meta,
                           "files": [{k: f[k] for k in ("name", "bytes", "sha256")} for f in files],
-                          "latest_published": publish_latest})
+                          "publish_latest_requested": publish_latest, **latest})
             save_json(journal, state)
             return {"status": "passed", "operation": "upload", "prefix": prefix, "store": store.identity,
                     "files": state["files"], "verified_parts": len(state["parts"]),
-                    "latest_published": publish_latest, "finished_at": utc()}
+                    **latest, "finished_at": utc()}
         except Exception:
             state.update({"status": "incomplete", "last_failure_at": utc()})
             save_json(journal, state)
@@ -564,10 +703,7 @@ def load_manifest(store, crypto, work, prefix=None):
     try:
         pointer = None
         if prefix is None:
-            store.get("encrypted-v1/LATEST.gpg", cipher, MAX_MANIFEST_BYTES)
-            pointer = crypto.decrypt_json(cipher)
-            if pointer.get("schema") != SCHEMA + ".pointer":
-                raise BackupError("Invalid latest pointer")
+            pointer, _ = read_pointer(store, crypto, work, "encrypted-v1/LATEST.gpg", SCHEMA, PREFIX)
             prefix = pointer.get("prefix", "")
         if not re.fullmatch(PREFIX, prefix):
             raise BackupError("Unsafe snapshot prefix")
@@ -579,6 +715,11 @@ def load_manifest(store, crypto, work, prefix=None):
         return validate_manifest(crypto.decrypt_json(cipher), prefix)
     finally:
         cipher.unlink(missing_ok=True)
+
+
+def publish_snapshot_latest(store, crypto, work, namespace, prefix, meta, read_only=False):
+    return publish_latest(store, crypto, work, namespace + "/LATEST.gpg", SCHEMA, PREFIX,
+                          prefix, meta, load_manifest, lambda manifest: manifest["stamp"], read_only)
 
 
 def publish_restored_directory(stage, destination):
@@ -648,7 +789,7 @@ def verify(store, crypto, work, prefix=None, destination=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("upload", "verify", "restore", "inspect"))
+    parser.add_argument("operation", choices=("upload", "verify", "restore", "inspect", "idle"))
     parser.add_argument("--snapshot-dir", type=Path)
     parser.add_argument("--manifest")
     parser.add_argument("--prefix")
@@ -672,6 +813,11 @@ def main(argv=None):
             print(json.dumps(read_snapshot(args.snapshot_dir, args.manifest), sort_keys=True))
             return 0
         state = private_dir(args.state_dir)
+        if args.operation == "idle":
+            with upload_lane_lock(state):
+                pass
+            print(json.dumps({"status": "idle"}, sort_keys=True))
+            return 0
         with tempfile.TemporaryDirectory(prefix="work-", dir=state) as work:
             crypto = GPG(args.key_file, work)
             store = LocalStore(args.local_store) if args.local_store else R2Store(args.account, args.bucket, args.credential_file)
@@ -690,8 +836,9 @@ def main(argv=None):
                     old_state = json.loads(legacy_journal.read_text())
                     if old_state.get("binding", {}).get("chunk_bytes") == args.chunk_bytes:
                         journal = legacy_journal
-                report = upload(snapshot, store, crypto, work, journal, args.chunk_bytes,
-                                args.namespace, not args.no_latest, lambda value: print(json.dumps(value), flush=True))
+                with upload_lane_lock(state):
+                    report = upload(snapshot, store, crypto, work, journal, args.chunk_bytes,
+                                    args.namespace, not args.no_latest, lambda value: print(json.dumps(value), flush=True))
             else:
                 if args.operation == "restore" and args.destination is None:
                     parser.error("--destination is required")

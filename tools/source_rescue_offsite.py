@@ -82,9 +82,7 @@ def _validate_manifest(manifest: dict, prefix: str) -> dict:
 def load_manifest(store, crypto, work: Path, prefix: str | None = None) -> dict:
     pointer = None
     if prefix is None:
-        cipher = work / "pointer.gpg"
-        store.get(LATEST, cipher, base.MAX_MANIFEST_BYTES)
-        pointer = crypto.decrypt_json(cipher)
+        pointer, _ = base.read_pointer(store, crypto, work, LATEST, SCHEMA, PREFIX)
         prefix = pointer.get("prefix")
         if pointer.get("schema") != SCHEMA + ".pointer" or not isinstance(prefix, str) or not re.fullmatch(PREFIX, prefix):
             raise base.BackupError("Encrypted source rescue pointer is invalid")
@@ -118,10 +116,8 @@ def upload(snapshot: dict, store, crypto, work: Path, state: Path, chunk_bytes: 
         if not re.fullmatch(PREFIX, prefix):
             raise base.BackupError("Source rescue journal prefix is invalid")
         if progress["status"] == "complete":
-            report = verify(store, crypto, work)
-            if report["prefix"] != prefix:
-                raise base.BackupError("Source rescue latest pointer changed")
-            return report
+            report = verify(store, crypto, work, prefix)
+            return {**report, **publish_latest(store, crypto, work, prefix, progress["manifest"], read_only=True)}
         cipher = work / "upload.gpg"
         files = []
         try:
@@ -171,22 +167,23 @@ def upload(snapshot: dict, store, crypto, work: Path, state: Path, chunk_bytes: 
                                          {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()})
                 progress["manifest"] = meta
                 base.save_json(journal, progress)
-            pointer = base.encode({"schema": SCHEMA + ".pointer", "prefix": prefix, "manifest": meta})
-            crypto.encrypt(pointer, cipher)
-            base.verified_put(store, LATEST, cipher, crypto, work,
-                              {"bytes": len(pointer), "sha256": hashlib.sha256(pointer).hexdigest()})
-            progress.update({"status": "complete", "completed_at": base.utc(), "manifest": meta})
+            latest = publish_latest(store, crypto, work, prefix, meta)
+            progress.update({"status": "complete", "completed_at": base.utc(), "manifest": meta, **latest})
             base.save_json(journal, progress)
-            report = verify(store, crypto, work)
-            if report["prefix"] != prefix:
-                raise base.BackupError("Source rescue latest pointer changed")
-            return report
+            return {**verify(store, crypto, work, prefix), **latest}
         except Exception:
             progress.update({"status": "incomplete", "last_failure_at": base.utc()})
             base.save_json(journal, progress)
             raise
         finally:
             cipher.unlink(missing_ok=True)
+
+
+def publish_latest(store, crypto, work, prefix, meta, read_only=False):
+    # Rescue artifacts identify their snapshot date, not an intra-day timestamp.
+    # Preserve an existing same-date pointer instead of inventing an ordering.
+    return base.publish_latest(store, crypto, work, LATEST, SCHEMA, PREFIX, prefix, meta,
+                               load_manifest, lambda manifest: manifest["prefix"].split("/")[1], read_only)
 
 
 def verify(store, crypto, work: Path, prefix: str | None = None, destination: Path | None = None) -> dict:

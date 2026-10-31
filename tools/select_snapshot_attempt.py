@@ -54,7 +54,9 @@ def select(root: Path, now: datetime | None = None) -> tuple[str, str, str]:
         if path.name != f"ATTEMPT.{attempt_id}.json" or abs((started - stamp_time).total_seconds()) > 5:
             raise ValueError("Attempt filename and start time differ")
         age = (now - started).total_seconds()
-        if age < -300 or age > MAX_AGE_SECONDS or started.date() != now.date():
+        # A valid attempt can cross UTC midnight before it reaches this lane.
+        # Freshness is elapsed time; a calendar-date change is not a failure.
+        if age < -300 or age > MAX_AGE_SECONDS:
             return ("failed", "", "")
         snapshot_dir = Path(data["snapshot_dir"])
         if snapshot_dir.resolve() != path.parent.resolve() or snapshot_dir.is_symlink():

@@ -14,6 +14,32 @@ For an event-driven or manual upload of a particular completed set, pass `SNAPSH
 - The journal binds the exact snapshot, store, namespace, and chunk size. Existing legacy journals resume when their requested chunk size matches. A different chunk size starts a separate journal and prefix; old partial objects remain for a reviewed retention decision.
 - `last-upload.json` must say `status: passed`, name the prefix, and report `latest_published: true`. That is an upload/byte-verification receipt, not a database or application restore receipt.
 
+### Concurrent and resumed uploads
+
+The latest pointer is compared by the snapshot's original UTC stamp, never by
+upload completion time. It is written with `If-None-Match: *` for the first
+pointer, or `If-Match` with the ETag from the authenticated pointer read. A
+conflict causes a bounded read-and-compare retry, without a blind-write fallback.
+An unreadable, corrupt or unversioned pointer stops publication. Completed
+journals reverify their own immutable prefix and the current pointer without
+writing it again.
+
+An older snapshot may finish uploading after a newer one. Its receipt then
+contains `latest_published: false`, `latest_status: retained_newer`, and the
+newer's `latest_prefix`; its own `prefix` remains available for explicit restore.
+Equal timestamps retain the current pointer (`retained_same_version`). Source
+rescue snapshots have only a date, so equal dates also retain the existing
+pointer rather than assuming which snapshot was created later. The scheduled
+wrapper still requires its chosen snapshot to be the latest before it reports
+the whole job complete.
+
+Local-store tests implement the same compare-and-swap contract with an atomic
+file replacement and an interprocess lock. That proves local behavior only.
+Before installing this change into the production uploader, verify conditional
+write rejection and readback on an isolated key through the actual R2 REST
+endpoint; S3/Workers documentation and local fixtures alone do not establish
+that endpoint's behavior. Never use a production `LATEST.gpg` for that probe.
+
 ## Recovery drill
 
 Work from a separate machine/account or isolated target with sufficient scratch space. Obtain the encryption key through the separately maintained recovery channel. Keep it out of Git, logs, and the restored payload directory.
